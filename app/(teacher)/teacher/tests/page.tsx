@@ -1134,8 +1134,24 @@ export default function TestsPage() {
       if (type === "codingTask") return teacherApi.hardDeleteCodingTask(id);
       throw new Error("Unknown type");
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["teacher"] });
+    onSuccess: (_data, variables) => {
+      if (variables.type === "pdf") {
+        // Keep active and archive PDF caches independently in sync after permanent delete.
+        queryClient.setQueriesData(
+          { queryKey: ["teacher", "archive", "pdfs"] },
+          (old: { items?: Array<{ id: number | string }> } | undefined) => {
+            if (!old?.items) return old;
+            return {
+              ...old,
+              items: old.items.filter((p) => Number(p.id) !== Number(variables.id)),
+            };
+          }
+        );
+        queryClient.invalidateQueries({ queryKey: ["teacher", "archive", "pdfs"] });
+        queryClient.invalidateQueries({ queryKey: ["teacher", "pdfs"] });
+      } else {
+        queryClient.invalidateQueries({ queryKey: ["teacher", "archive"] });
+      }
       setShowHardDeleteModal(null);
       setHardDeleteStep(1);
       setHardDeleteConfirm(false);
