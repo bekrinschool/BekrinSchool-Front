@@ -14,6 +14,39 @@ interface ModalProps {
 export function Modal({ isOpen, onClose, title, children, size = "md" }: ModalProps) {
   useEffect(() => {
     if (!isOpen) return;
+    const body = document.body;
+    const html = document.documentElement;
+    const scrollY = window.scrollY;
+    const prev = {
+      overflow: body.style.overflow,
+      paddingRight: body.style.paddingRight,
+      position: body.style.position,
+      top: body.style.top,
+      width: body.style.width,
+    };
+
+    const scrollbarWidth = Math.max(0, window.innerWidth - html.clientWidth);
+    body.style.overflow = "hidden";
+    if (scrollbarWidth > 0) {
+      body.style.paddingRight = `${scrollbarWidth}px`;
+    }
+    // Freeze viewport position to prevent jump/empty bottom gap on close.
+    body.style.position = "fixed";
+    body.style.top = `-${scrollY}px`;
+    body.style.width = "100%";
+
+    return () => {
+      body.style.overflow = prev.overflow;
+      body.style.paddingRight = prev.paddingRight;
+      body.style.position = prev.position;
+      body.style.top = prev.top;
+      body.style.width = prev.width;
+      window.scrollTo(0, scrollY);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };

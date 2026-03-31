@@ -874,12 +874,19 @@ export default function StudentExamsPage() {
         const a = answerSnap[key];
         const openSubType = subTypeFromRule(q.open_rule);
         const normalizedTextAnswer = normalizeAnswer(a?.textAnswer ?? "", openSubType);
+        const qNumber = q.questionNumber ?? q.displayNumber;
         if (q.questionId != null) {
-          return { questionId: q.questionId, selectedOptionId: a?.selectedOptionId ?? null, textAnswer: normalizedTextAnswer };
+          return {
+            questionId: q.questionId,
+            questionNumber: qNumber,
+            selectedOptionId: a?.selectedOptionId ?? null,
+            selectedOptionKey: a?.selectedOptionKey ?? undefined,
+            textAnswer: normalizedTextAnswer,
+          };
         }
         return {
-          questionNumber: q.questionNumber,
-          selectedOptionId: a?.selectedOptionId ?? undefined,
+          questionNumber: qNumber,
+          selectedOptionId: a?.selectedOptionId ?? null,
           selectedOptionKey: a?.selectedOptionKey ?? undefined,
           textAnswer: normalizedTextAnswer,
         };
@@ -1019,7 +1026,7 @@ export default function StudentExamsPage() {
             submitMutation={submitMutation}
             countdownMs={countdownMs}
             containerRef={examContainerRef}
-            initialPdfScribbles={undefined}
+            initialPdfScribbles={startedExam.pdfScribbles ?? null}
             formatCountdown={formatCountdown}
             resumeQuestionIndex={startedExam.resumeQuestionIndex}
           />
