@@ -1,0 +1,458 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global responsive: prevent horizontal overflow */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  @apply antialiased;
+  background: #F7F8FC;
+  color: #0f172a;
+  font-family: var(--font-ui, ui-sans-serif), system-ui, -apple-system, Segoe UI,
+    sans-serif;
+  overflow-x: hidden;
+}
+
+/* Full-height chain for full-viewport pages */
+html,
+body {
+  height: 100%;
+}
+
+/* Touch-friendly tap targets (override with smaller classes where needed) */
+button:not(.no-touch-target),
+a:not(.no-touch-target),
+input:not([type="hidden"]):not(.no-touch-target),
+select:not(.no-touch-target),
+textarea:not(.no-touch-target) {
+  min-height: 44px;
+}
+
+/* Responsive images */
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/*
+  Breakpoint system (Tailwind defaults; use for responsive design):
+  xs:  0–480px   (phones portrait)
+  sm:  481–768px (phones landscape / small tablets) — Tailwind sm: 640px
+  md:  769–1024px (tablets, primary target) — Tailwind md: 768px
+  lg:  1025–1280px (small laptops) — Tailwind lg: 1024px
+  xl:  1281px+   (desktops) — Tailwind xl: 1280px
+*/
+
+/* Lock viewport scroll when student is in exam (body lock applied via class from Layout) */
+html.body-exam-lock,
+html.body-exam-lock body {
+  height: 100%;
+  overflow: hidden;
+}
+
+.card {
+  @apply bg-white rounded-xl shadow-sm border border-slate-200 p-6;
+}
+
+.card-muted {
+  @apply bg-slate-50 rounded-xl border border-slate-200 p-6;
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-600 transition-colors disabled:opacity-60 disabled:cursor-not-allowed;
+}
+
+.btn-outline {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-100 transition-colors;
+}
+
+.input {
+  @apply w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-primary bg-white;
+}
+
+/* Situasiya canvas: brush size slider — visible track + blue fill (WebKit + Firefox) */
+input[type="range"].situasiya-brush-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.25rem;
+  width: 6.5rem;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"].situasiya-brush-range:focus {
+  outline: none;
+}
+input[type="range"].situasiya-brush-range::-webkit-slider-runnable-track {
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    rgb(37 99 235) 0%,
+    rgb(37 99 235) var(--situasiya-range-pct, 0%),
+    rgb(203 213 225) var(--situasiya-range-pct, 0%),
+    rgb(203 213 225) 100%
+  );
+}
+input[type="range"].situasiya-brush-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1rem;
+  height: 1rem;
+  margin-top: -0.25rem;
+  border-radius: 9999px;
+  background: #fff;
+  border: 2px solid rgb(37 99 235);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.12);
+}
+input[type="range"].situasiya-brush-range::-moz-range-track {
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: rgb(203 213 225);
+}
+input[type="range"].situasiya-brush-range::-moz-range-progress {
+  height: 0.5rem;
+  border-radius: 9999px 0 0 9999px;
+  background: rgb(37 99 235);
+}
+input[type="range"].situasiya-brush-range::-moz-range-thumb {
+  width: 1rem;
+  height: 1rem;
+  border: none;
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 0 0 2px rgb(37 99 235), 0 1px 2px rgb(15 23 42 / 0.12);
+}
+
+.label {
+  @apply mb-1 block text-sm font-medium text-slate-700;
+}
+
+.page-container {
+  @apply max-w-6xl mx-auto px-4 py-6;
+}
+
+/* Exam fullscreen: fill viewport; 100dvh avoids mobile URL bar / resume layout jump vs 100vh */
+.exam-content-container:fullscreen,
+.exam-content-container:-webkit-full-screen {
+  width: 100%;
+  height: 100%;
+  min-height: 100dvh;
+}
+
+.exam-content-container::backdrop {
+  background-color: #ffffff !important;
+}
+
+/* Two-panel exam layout: critical min-height so flex row doesn't expand past viewport */
+.exam-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.exam-panels {
+  min-height: 0;
+}
+
+.panel-pdf {
+  flex: 0 0 58%;
+}
+
+/* When answer sheet is closed, PDF panel expands to fill */
+.panel-pdf.panel-pdf-expanded {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
+.panel-answers {
+  flex: 1;
+  min-width: 0;
+  min-height: 0; /* allow flex child to shrink so overflow-y-auto creates scroll */
+}
+
+/* Answer sheet closed: remove from layout flow (no empty space) */
+.panel-answers-hidden {
+  display: none !important;
+}
+
+/* Tablet/mobile drawer: explicit height + overflow so scroll works on all devices */
+.answer-drawer-scroll {
+  overflow-y: scroll;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+}
+
+/* Responsive: stack panels on narrow screens */
+@media (max-width: 768px) {
+  .exam-panels {
+    flex-direction: column;
+  }
+  .panel-pdf {
+    flex: 0 0 50vh !important;
+    min-height: 200px;
+  }
+  .panel-pdf.panel-pdf-expanded {
+    flex: 0 0 50vh !important;
+  }
+  .panel-answers {
+    flex: 1;
+    min-height: 0;
+  }
+}
+
+/* =========================================================
+   Precision Dashboard — Attendance (Dense, No-Scroll Target)
+   Fits 20 rows @ 1366x768 by design (row height via CSS var)
+   ========================================================= */
+:root {
+  --attendance-row-h: 32px; /* hard cap: 20 rows target */
+  --attendance-header-h: 40px; /* toolbar row target */
+  --attendance-table-head-h: 34px;
+  --attendance-accent: #3b5bdb;
+  --attendance-bg: #f7f8fc;
+  --attendance-navy: #1e2a3a;
+}
+
+.attendance-page {
+  background: var(--attendance-bg);
+  overflow: hidden;
+}
+
+.attendance-page .precision-tabs {
+  height: 32px;
+  border-radius: 8px;
+  padding: 2px;
+  background: rgba(30, 41, 59, 0.06);
+  display: inline-flex;
+  gap: 2px;
+}
+
+.attendance-page .precision-tab {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 28px;
+  font-weight: 600;
+  color: #6b7280;
+  background: transparent;
+}
+
+.attendance-page .precision-tab-active {
+  background: var(--attendance-accent);
+  color: #ffffff;
+}
+
+/* Toolbar can wrap to multiple rows; do not clip filters/actions */
+.attendance-page .precision-toolbar {
+  min-height: var(--attendance-header-h);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  row-gap: 10px;
+  overflow: visible;
+}
+
+.attendance-page .attendance-type-filter {
+  height: 32px;
+  align-items: stretch;
+  flex-shrink: 0;
+}
+
+.attendance-page .attendance-type-filter .precision-tab {
+  height: 32px;
+  line-height: 30px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.attendance-page .precision-toolbar .label {
+  margin-bottom: 0;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.attendance-page .precision-toolbar .input,
+.attendance-page .precision-toolbar input,
+.attendance-page .precision-toolbar select,
+.attendance-page .precision-toolbar button {
+  height: 32px;
+  min-height: 0; /* override 44px tap target */
+  font-size: 13px;
+  border-radius: 6px;
+}
+
+.attendance-page .attendance-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+  line-height: 1.15;
+  font-family: var(--font-mono, ui-monospace), ui-monospace, SFMono-Regular, Menlo,
+    Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.attendance-page .attendance-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--attendance-navy);
+}
+
+.attendance-page .attendance-table th {
+  height: var(--attendance-table-head-h);
+  padding: 0 12px;
+  color: #ffffff;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attendance-page .attendance-table td {
+  height: var(--attendance-row-h) !important;
+  padding: 4px 12px;
+  border-bottom: 1px solid #e5e7eb;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+/* Force row height even if inline style sets height */
+.attendance-page .attendance-table tbody tr {
+  height: var(--attendance-row-h) !important;
+}
+
+.attendance-page .attendance-table tbody tr:nth-child(odd) {
+  background: #ffffff;
+}
+
+.attendance-page .attendance-table tbody tr:nth-child(even) {
+  background: #f9fafb;
+}
+
+.attendance-page .attendance-table tbody tr:hover {
+  background: #eef2ff;
+}
+
+.attendance-page .attendance-table .col-rownum {
+  width: 32px;
+  color: #64748b;
+  text-align: right;
+  padding-right: 6px;
+}
+
+.attendance-page .attendance-table .col-check {
+  width: 32px;
+}
+
+.attendance-page .attendance-table .col-name {
+  max-width: 180px;
+}
+
+.attendance-page .attendance-table .col-status {
+  width: 140px;
+  text-align: right;
+}
+
+.attendance-page .attendance-table input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+/* Pill-style select (still native & keyboard accessible) */
+.attendance-page select.status-select {
+  height: 26px;
+  min-height: 0;
+  font-size: 12px;
+  line-height: 26px;
+  border-radius: 999px;
+  border: 0;
+  padding: 2px 22px 2px 8px;
+  appearance: none;
+  box-shadow: none;
+  outline: none;
+  background-image: linear-gradient(45deg, transparent 50%, rgba(0, 0, 0, 0.45) 50%),
+    linear-gradient(135deg, rgba(0, 0, 0, 0.45) 50%, transparent 50%);
+  background-position: calc(100% - 12px) 50%, calc(100% - 8px) 50%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+/* Reduce spacing between toolbar and table (8px max) */
+.attendance-page .attendance-header {
+  padding-bottom: 8px !important;
+}
+
+.attendance-page select.status-select[data-status="present"] {
+  background-color: #d1fae5;
+  color: #065f46;
+}
+.attendance-page select.status-select[data-status="absent"] {
+  background-color: #fee2e2;
+  color: #991b1b;
+}
+.attendance-page select.status-select[data-status="late"] {
+  background-color: #fef3c7;
+  color: #92400e;
+}
+
+.attendance-page select.status-select[data-status="excused"] {
+  background-color: #e0e7ff;
+  color: #3730a3;
+}
+
+/* --- Attendance row density (tab-specific; Aylıq unchanged) --- */
+.attendance-page .attendance-table--daily td {
+  padding: 2px 10px !important;
+}
+
+.attendance-page .attendance-table--daily thead th {
+  padding-top: 4px !important;
+  padding-bottom: 4px !important;
+  vertical-align: middle;
+}
+
+.attendance-page .attendance-table--daily select.status-select {
+  height: 22px;
+  min-height: 0;
+  line-height: 22px;
+  font-size: 11px;
+  padding: 1px 20px 1px 8px;
+}
+
+.attendance-page .attendance-table--grid td {
+  padding: 1px 6px !important;
+  vertical-align: middle;
+}
+
+.attendance-page .attendance-table--grid thead th {
+  vertical-align: middle;
+}
+
+/* Keep status chips inside thinner Cədvəl rows (overrides utility classes) */
+.attendance-page .attendance-table--grid tbody td button[type="button"] {
+  min-height: 0 !important;
+  height: 1rem !important;
+  min-width: 2rem !important;
+  font-size: 0.625rem !important;
+  line-height: 1rem !important;
+  padding-left: 0.25rem !important;
+  padding-right: 0.25rem !important;
+}
+

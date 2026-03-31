@@ -1,0 +1,42 @@
+{
+  "name": "bekrin-front",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev --webpack",
+    "dev:turbo": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "clean": "npx --yes rimraf .next",
+    "fresh": "npm run clean && npm run build && npm run dev"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^3.3.4",
+    "@tanstack/react-query": "^5.40.0",
+    "fabric": "^7.2.0",
+    "katex": "^0.16.40",
+    "lucide-react": "^0.344.0",
+    "next": "^16.1.6",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-hook-form": "^7.51.0",
+    "react-latex-next": "^3.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/fabric": "^5.3.11",
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "autoprefixer": "^10.4.18",
+    "eslint": "^9.18.0",
+    "eslint-config-next": "^16.1.6",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.5.0"
+  }
+}

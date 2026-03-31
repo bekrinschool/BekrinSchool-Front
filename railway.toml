@@ -1,0 +1,11 @@
+# Railway: create a service with Root Directory = bekrin-front/
+# Build-time env (dashboard): NEXT_PUBLIC_API_BASE_URL or NEXT_PUBLIC_API_URL = https://<your-backend>.up.railway.app/api
+# Next.js bakes NEXT_PUBLIC_* at build time — set before deploy/build.
+
+[build]
+builder = "RAILPACK"
+buildCommand = "npm install && npm run build"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "ON_FAILURE"
