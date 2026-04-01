@@ -440,7 +440,20 @@ export const ImageExamViewer = forwardRef<ImageExamViewerRef, ImageExamViewerPro
             >
               {sidebarOpen ? <PanelRightClose className="h-5 w-5" /> : <PanelRightOpen className="h-5 w-5" />}
             </button>
-            <button type="button" onClick={onSubmitClick} disabled={submitMutation.isPending} className="btn-primary flex items-center gap-2 py-2">
+            <button
+              type="button"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onSubmitClick();
+              }}
+              disabled={submitMutation.isPending}
+              className="btn-primary flex items-center gap-2 py-2"
+            >
               <Send className="h-5 w-5" />
               Göndər
             </button>

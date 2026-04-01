@@ -544,9 +544,9 @@ export default function StudentExamsPage() {
     const raw = typeof localStorage !== "undefined" ? localStorage.getItem(EXAM_RUN_STORAGE_KEY) : null;
     if (!raw) return;
     try {
-      const saved = JSON.parse(raw) as { attemptId?: number; runId?: number; answers?: Record<string, { selectedOptionId?: number | string; selectedOptionKey?: string; textAnswer?: string }> };
-      if (saved.runId != null && saved.attemptId != null && saved.answers) {
-        pendingRestoreRef.current = { attemptId: saved.attemptId, answers: saved.answers };
+      const saved = JSON.parse(raw) as { runId?: number };
+      if (saved.runId != null) {
+        // Re-enter current run and hydrate from server-side savedAnswers for the active attempt.
         startMutation.mutate(saved.runId);
       }
     } catch {
@@ -632,18 +632,7 @@ export default function StudentExamsPage() {
       }
       sessionRevisionRef.current = ext.sessionRevision ?? 0;
 
-      const isRestore = pendingRestoreRef.current != null && data.attemptId === pendingRestoreRef.current.attemptId;
-      const restoredAnswers = isRestore ? pendingRestoreRef.current!.answers : {};
-      if (isRestore) {
-        try {
-          localStorage.removeItem(EXAM_RUN_STORAGE_KEY);
-        } catch {
-          // ignore
-        }
-        pendingRestoreRef.current = null;
-      }
       const fromServer = answersFromSavedRows(ext.savedAnswers);
-      const mergedAnswers = { ...fromServer, ...restoredAnswers };
 
       const mapQuestionOptions = (q: StartedQuestion) => ({
         ...q,
@@ -685,7 +674,7 @@ export default function StudentExamsPage() {
           sessionRevision: ext.sessionRevision,
         });
         setExpired(true);
-        setAnswers(mergedAnswers);
+        setAnswers(fromServer);
       } else {
         const rawQs = (data.questions ?? []) as StartedQuestion[];
         const normalized =
@@ -710,7 +699,7 @@ export default function StudentExamsPage() {
           resumeQuestionIndex: ext.resumeQuestionIndex,
         });
         setExpired(false);
-        setAnswers(mergedAnswers);
+        setAnswers(fromServer);
       }
       setSubmitted(false);
     },
