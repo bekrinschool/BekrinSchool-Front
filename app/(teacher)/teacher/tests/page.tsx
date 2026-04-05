@@ -16,6 +16,7 @@ import {
   ActiveRunItem,
   FinishedRunItem,
   QuestionBankItem,
+  Student,
 } from "@/lib/teacher";
 import { Loading } from "@/components/Loading";
 import { Modal } from "@/components/Modal";
@@ -29,11 +30,14 @@ import { Plus, Trash2, Clock, CheckCircle2, Eye, Check, X, StopCircle, RotateCcw
 
 import ExamPreview from "@/components/exam/ExamPreview";
 import { SituationSmartCard } from "@/components/exam/SituationSmartCard";
+import { formatMcSelectionForDisplay, tokensLooselyEqual } from "@/lib/mc-option-display";
 import { UniversalLatex } from "@/components/common/MathContent";
 import { normalizeAnswer, normalizeMatchingAnswer, subTypeFromRule } from "@/lib/answer-normalizer";
+import { PDF_EXAM_ANSWER_KEY_TEMPLATE, validateAndNormalizeAnswerKeyJson } from "@/lib/answer-key-validate";
+import { CodeEditor } from "@/components/student-coding/CodeEditor";
 
 type TabType = "bank" | "active" | "grading" | "old" | "archive";
-type ArchiveSubTab = "exams" | "questions" | "topics" | "pdfs" | "codingTopics" | "codingTasks";
+type ArchiveSubTab = "exams" | "questions" | "topics" | "pdfs" | "codingTopics" | "codingTasks" | "students";
 
 const testSchema = z.object({
   type: z.enum(["quiz", "exam"]),
@@ -56,12 +60,11 @@ const examSchema = z.object({
   maxScore: z.number().min(1, "Maksimum bal tələb olunur").max(500, "Maksimum 500 ola bilər").optional(),
 });
 
-/** Exam: exactly 30 (22 closed + 5 open + 3 situation). Quiz: min 1 question, no maximum. */
-const EXAM_REQUIRED = { closed: 22, open: 5, situation: 3, total: 30 };
-const QUIZ_MIN_TOTAL = 1;
+/** Exam and quiz: ən azı 1 sual (dinamik tərkib). */
+const MIN_EXAM_QUESTIONS = 1;
 
-function getRequiredCounts(type: "quiz" | "exam") {
-  return type === "exam" ? EXAM_REQUIRED : { minTotal: QUIZ_MIN_TOTAL };
+function getRequiredCounts(_type: "quiz" | "exam") {
+  return { minTotal: MIN_EXAM_QUESTIONS };
 }
 
 function canTeacherHardRestartAttempt(
@@ -117,15 +120,11 @@ function getCountsFromDetail(examDetail: ExamDetail | null | undefined): { close
 
 function isCompositionValid(
   counts: { closed: number; open: number; situation: number } | null,
-  type: "quiz" | "exam"
+  _type: "quiz" | "exam"
 ): boolean {
   if (!counts) return false;
   const total = counts.closed + counts.open + counts.situation;
-  if (type === "exam") {
-    const r = getRequiredCounts("exam") as { closed: number; open: number; situation: number; total: number };
-    return total === r.total && counts.closed === r.closed && counts.open === r.open && counts.situation === r.situation;
-  }
-  return total >= QUIZ_MIN_TOTAL;
+  return total >= MIN_EXAM_QUESTIONS;
 }
 
 /** Same order as Django: situation rows = requires_manual_check, order_by question_number */
@@ -214,14 +213,10 @@ type BlueprintItemLike = {
   correctOptionId?: string;
 };
 
-/** Loose match for MC option id vs stored selection (number/string/key). */
+/** Loose match for MC option id vs stored selection (number/string/key, opt_1 vs OPT_1, etc.). */
 function optionIdMatchesSelection(optId: unknown, selectedToken: string | null): boolean {
   if (selectedToken == null || selectedToken === "") return false;
-  const a = String(optId ?? "").trim();
-  const b = String(selectedToken).trim();
-  if (a === b) return true;
-  if (a.toUpperCase() === b.toUpperCase()) return true;
-  return false;
+  return tokensLooselyEqual(optId, selectedToken);
 }
 
 function normalizeQuestionKind(t?: string | null): "mc" | "open" | "situation" | "other" {
@@ -396,35 +391,12 @@ function getQuestionStatus(
   };
 }
 
-const VARIANT_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
-
-/**
- * PDF/JSON exams store MC keys like opt_1, opt_2. Map to A, B, C… using the same
- * option order the student saw (blueprint `options` array).
- */
+/** PDF/JSON MC: show A–E / option text instead of raw opt_* keys. */
 function formatMcVariantLabelForTeacher(
   raw: string | null | undefined,
-  blueprintOptions: Array<{ id?: string | number }>
+  blueprintOptions: Array<{ id?: string | number; text?: string | null }>
 ): string {
-  if (raw == null) return "—";
-  const s = String(raw).trim();
-  if (s === "") return "—";
-  const opts = blueprintOptions ?? [];
-  const byMatch = opts.findIndex((o) => optionIdMatchesSelection(o.id, s));
-  if (byMatch >= 0) return VARIANT_LETTERS[byMatch] ?? s;
-  const optPat = /^opt_(\d+)$/i.exec(s);
-  if (optPat) {
-    const n = parseInt(optPat[1], 10);
-    if (Number.isFinite(n) && n >= 1) {
-      const i = n - 1;
-      if (opts.length > 0 && i < opts.length) {
-        return VARIANT_LETTERS[i] ?? s;
-      }
-      return VARIANT_LETTERS[i] ?? s;
-    }
-  }
-  if (/^[A-Za-z]$/.test(s)) return s.toUpperCase();
-  return s;
+  return formatMcSelectionForDisplay(raw, blueprintOptions);
 }
 
 function findMcOptionTextById(
@@ -434,7 +406,7 @@ function findMcOptionTextById(
   if (!bpOptions || !Array.isArray(bpOptions) || optionId == null) return null;
   const token = String(optionId).trim();
   if (!token) return null;
-  const opt = bpOptions.find((o) => String(o.id ?? "").trim() === token);
+  const opt = bpOptions.find((o) => tokensLooselyEqual(o.id, token));
   return opt?.text ?? null;
 }
 
@@ -560,6 +532,14 @@ export default function TestsPage() {
   const [showAddQuestions, setShowAddQuestions] = useState(false);
   const [selectedExamId, setSelectedExamId] = useState<number | null>(null);
   const [selectedArchiveExams, setSelectedArchiveExams] = useState<Set<number>>(new Set());
+  const [selectedArchiveQuestions, setSelectedArchiveQuestions] = useState<Set<number>>(new Set());
+  const [selectedArchiveTopics, setSelectedArchiveTopics] = useState<Set<number>>(new Set());
+  const [selectedArchivePdfs, setSelectedArchivePdfs] = useState<Set<number>>(new Set());
+  const [selectedArchiveCodingTopics, setSelectedArchiveCodingTopics] = useState<Set<number>>(new Set());
+  const [selectedArchiveCodingTasks, setSelectedArchiveCodingTasks] = useState<Set<number>>(new Set());
+  const [selectedArchiveStudents, setSelectedArchiveStudents] = useState<Set<number>>(new Set());
+  const [archiveBulkConfirm, setArchiveBulkConfirm] = useState<{ category: string; ids: number[] } | null>(null);
+  const [archiveBulkReadOk, setArchiveBulkReadOk] = useState(false);
   const [examTopicFilter, setExamTopicFilter] = useState("");
   const [examQuestionSearch, setExamQuestionSearch] = useState("");
   const debouncedExamQuestionSearch = useDebounce(examQuestionSearch, 300);
@@ -568,7 +548,6 @@ export default function TestsPage() {
   const [showGradingModal, setShowGradingModal] = useState(false);
   const [manualScores, setManualScores] = useState<Record<string, number | undefined>>({});
   const [situationManualScores, setSituationManualScores] = useState<Record<string, number | undefined>>({});
-  const [situationSaveState, setSituationSaveState] = useState<Record<string, "idle" | "saving" | "saved" | "error">>({});
   const [canvasPreviewUrl, setCanvasPreviewUrl] = useState<string | null>(null);
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [publishConfirmRun, setPublishConfirmRun] = useState<{ runId: number; title: string } | null>(null);
@@ -587,10 +566,8 @@ export default function TestsPage() {
   const [archiveSubTab, setArchiveSubTab] = useState<ArchiveSubTab>("exams");
   const [archiveSearch, setArchiveSearch] = useState("");
   const [showHardDeleteModal, setShowHardDeleteModal] = useState<{ type: string; id: number; name: string } | null>(null);
-  const [hardDeleteStep, setHardDeleteStep] = useState<1 | 2>(1);
-  const [hardDeleteConfirm, setHardDeleteConfirm] = useState(false);
-  const [hardDeleteTyped, setHardDeleteTyped] = useState("");
-  const [createExamSource, setCreateExamSource] = useState<"BANK" | "JSON" | "PDF">("BANK");
+  const [hardDeleteReadOk, setHardDeleteReadOk] = useState(false);
+  const [createExamSource, setCreateExamSource] = useState<"BANK" | "PDF">("BANK");
   const [groupStudentSearch, setGroupStudentSearch] = useState("");
   const [extendRunModal, setExtendRunModal] = useState<ActiveRunItem | null>(null);
   const [extendRunDuration, setExtendRunDuration] = useState(60);
@@ -740,6 +717,11 @@ export default function TestsPage() {
     queryFn: () => teacherApi.getArchivePdfs({ q: debouncedArchiveSearch || undefined }),
     enabled: activeTab === "archive" && archiveSubTab === "pdfs",
   });
+  const { data: archiveStudentsData } = useQuery({
+    queryKey: ["teacher", "archive", "students", debouncedArchiveSearch],
+    queryFn: () => teacherApi.getArchiveStudents({ q: debouncedArchiveSearch || undefined }),
+    enabled: activeTab === "archive" && archiveSubTab === "students",
+  });
   const {
     data: attemptDetail,
     isLoading: attemptDetailLoading,
@@ -759,26 +741,27 @@ export default function TestsPage() {
   }, [showGradingModal, selectedAttemptId, refetchAttemptDetail]);
 
   useEffect(() => {
-    // Prevent previous student's transient manual state from leaking visually.
-    setManualScores({});
-    setSituationManualScores({});
+    if (selectedAttemptId == null) {
+      setManualScores({});
+      setSituationManualScores({});
+    }
   }, [selectedAttemptId]);
 
   useEffect(() => {
     if (!attemptDetail?.answers || selectedAttemptId == null) return;
+    if (Number(attemptDetail.attemptId) !== Number(selectedAttemptId)) return;
     const next: Record<string, number | undefined> = {};
     const nextSituationManual: Record<string, number | undefined> = {};
     for (const a of attemptDetail.answers) {
-      if (a.id != null) {
-        const v = a.manualScore ?? (a as { manual_score?: number }).manual_score;
-        if (typeof v === "number" && !Number.isNaN(v)) {
-          next[String(a.id)] = v;
-          const isSituation =
-            (a.questionType as string) === "SITUATION" ||
-            (a.questionType as string)?.toLowerCase() === "situation";
-          if (isSituation) {
-            nextSituationManual[String(a.id)] = v;
-          }
+      if (a.id == null) continue;
+      const serverManual = a.manualScore ?? (a as { manual_score?: number | null }).manual_score;
+      if (serverManual != null && typeof serverManual === "number" && !Number.isNaN(serverManual)) {
+        next[String(a.id)] = serverManual;
+        const isSituation =
+          (a.questionType as string) === "SITUATION" ||
+          (a.questionType as string)?.toLowerCase() === "situation";
+        if (isSituation) {
+          nextSituationManual[String(a.id)] = serverManual;
         }
       }
     }
@@ -824,7 +807,7 @@ export default function TestsPage() {
     ) && Boolean((d as { has_answer_key?: boolean })?.has_answer_key);
     const canActivate = valid && (sourceType !== "PDF" || hasPdfAndAnswerKey);
     const invalidReason = !valid
-      ? "Sual tərkibi uyğun deyil (imtahan: tam 30 sual — 22 qapalı + 5 açıq + 3 situasiya; quiz: ən azı 1 sual)."
+      ? "Sual tərkibi uyğun deyil (imtahan və quiz: ən azı 1 sual)."
       : sourceType === "PDF" && !hasPdfAndAnswerKey
         ? "PDF imtahanı üçün PDF faylı və cavab açarı tələb olunur."
         : null;
@@ -862,7 +845,7 @@ export default function TestsPage() {
       queryClient.invalidateQueries({ queryKey: ["teacher", "exams"] });
       setShowCreateExam(false);
     },
-    onError: (error: any) => {
+    onError: (error: any, variables) => {
       console.error("Create exam error:", error);
       console.error("Error status:", error?.status);
       console.error("Error message:", error?.message);
@@ -870,22 +853,36 @@ export default function TestsPage() {
       console.error("Full error object:", JSON.stringify(error, null, 2));
       const errorData = error?.response?.data || error?.data;
       let errorMessage = error?.message || "İmtahan yaradıla bilmədi";
-      if (errorData) {
+      const backendErrors = errorData?.errors;
+      if (Array.isArray(backendErrors) && backendErrors.length > 0) {
+        const joined = backendErrors.map((e: unknown) => String(e)).join(" · ");
+        errorMessage = joined;
+        if (variables?.source_type === "PDF") {
+          setCreateExamJsonError(joined);
+        }
+      } else if (errorData) {
         if (errorData.detail) {
-          errorMessage = errorData.detail;
-        } else if (typeof errorData === 'object' && !Array.isArray(errorData)) {
+          errorMessage =
+            typeof errorData.detail === "string"
+              ? errorData.detail
+              : JSON.stringify(errorData.detail);
+          if (variables?.source_type === "PDF" && typeof errorData.detail === "string") {
+            setCreateExamJsonError(errorData.detail);
+          }
+        } else if (typeof errorData === "object" && !Array.isArray(errorData)) {
           const fieldErrors: string[] = [];
-          for (const [field, errors] of Object.entries(errorData)) {
-            if (Array.isArray(errors)) {
-              fieldErrors.push(`${field}: ${errors.join(', ')}`);
-            } else if (typeof errors === 'string') {
-              fieldErrors.push(`${field}: ${errors}`);
-            } else if (errors && typeof errors === 'object') {
-              fieldErrors.push(`${field}: ${JSON.stringify(errors)}`);
+          for (const [field, errs] of Object.entries(errorData)) {
+            if (field === "errors") continue;
+            if (Array.isArray(errs)) {
+              fieldErrors.push(`${field}: ${errs.join(", ")}`);
+            } else if (typeof errs === "string") {
+              fieldErrors.push(`${field}: ${errs}`);
+            } else if (errs && typeof errs === "object") {
+              fieldErrors.push(`${field}: ${JSON.stringify(errs)}`);
             }
           }
-          errorMessage = fieldErrors.length > 0 ? fieldErrors.join('; ') : (errorData.message || JSON.stringify(errorData));
-        } else if (typeof errorData === 'string') {
+          errorMessage = fieldErrors.length > 0 ? fieldErrors.join("; ") : errorData.message || JSON.stringify(errorData);
+        } else if (typeof errorData === "string") {
           errorMessage = errorData;
         }
       }
@@ -940,69 +937,18 @@ export default function TestsPage() {
       queryClient.invalidateQueries({ queryKey: ["teacher", "run-attempts"] });
       queryClient.invalidateQueries({ queryKey: ["student", "exam-results"] });
       queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      toast.success("Qiymətləndirmə yadda saxlanıldı");
       setShowGradingModal(false);
       setManualScores({});
       setSituationManualScores({});
       setSelectedAttemptId(null);
     },
+    onError: (e: unknown) => {
+      const err = e as { response?: { data?: { detail?: string } }; message?: string };
+      const msg = err?.response?.data?.detail || err?.message || "Saxlama alınmadı";
+      toast.error(String(msg));
+    },
   });
-
-  const handleSaveSituation = useCallback(async (params: {
-    answerId: number;
-    examRunId?: number | null;
-    situationIndex: number;
-    score: number;
-    sourceType: "BANK" | "PDF" | "JSON";
-    teacherComment?: string;
-  }) => {
-    if (!selectedAttemptId) return;
-    const key = String(params.answerId);
-    setSituationSaveState((prev) => ({ ...prev, [key]: "saving" }));
-    // optimistic score sync
-    setSituationManualScores((prev) => ({ ...prev, [key]: params.score }));
-    setManualScores((prev) => ({ ...prev, [key]: params.score }));
-    try {
-      const basePayload = {
-        student_answer_id: params.answerId,
-        score: params.score,
-        teacher_notes: params.teacherComment ?? "",
-        exam_run_id: params.examRunId ?? attemptDetail?.runId ?? null,
-        publish: false,
-      };
-      // Debug aid: verify source-agnostic grading payload
-      console.info("handleSaveSituation payload", basePayload);
-      if (params.sourceType === "PDF") {
-        await teacherApi.gradeAttempt(selectedAttemptId, {
-          ...basePayload,
-          per_situation_scores: [{ index: params.situationIndex, manual_score: params.score }],
-          manualScores: { [key]: params.score },
-          notes: params.teacherComment ?? "",
-        });
-      } else {
-        await teacherApi.gradeAttempt(selectedAttemptId, {
-          ...basePayload,
-          manualScores: { [key]: params.score },
-          notes: params.teacherComment ?? "",
-        });
-      }
-      setSituationSaveState((prev) => ({ ...prev, [key]: "saved" }));
-      toast.success("Yadda saxlanıldı");
-      setTimeout(() => {
-        setSituationSaveState((prev) => ({ ...prev, [key]: "idle" }));
-      }, 1800);
-      queryClient.invalidateQueries({ queryKey: ["teacher", "attempt-detail", selectedAttemptId] });
-      queryClient.invalidateQueries({ queryKey: ["teacher", "grading-attempts"] });
-    } catch (e: any) {
-      setSituationSaveState((prev) => ({ ...prev, [key]: "error" }));
-      const backendMsg =
-        e?.data?.detail ||
-        e?.response?.data?.detail ||
-        e?.data?.message ||
-        e?.message ||
-        "Saxlama alınmadı";
-      toast.error(String(backendMsg));
-    }
-  }, [attemptDetail?.runId, queryClient, selectedAttemptId, toast]);
 
   useEffect(() => {
     const pages = (attemptDetail as { pages?: string[] } | undefined)?.pages;
@@ -1117,11 +1063,29 @@ export default function TestsPage() {
       toast.error(err?.message || "Silmə zamanı xəta baş verdi");
     },
   });
-  const bulkDeleteExamsMutation = useMutation({
-    mutationFn: (ids: number[]) => teacherApi.bulkDeleteExams(ids),
-    onSuccess: () => {
+  const archiveBulkDeleteMutation = useMutation({
+    mutationFn: ({ category, ids }: { category: string; ids: number[] }) =>
+      teacherApi.archiveBulkDelete(category, ids),
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["teacher", "archive"] });
       setSelectedArchiveExams(new Set());
+      setSelectedArchiveQuestions(new Set());
+      setSelectedArchiveTopics(new Set());
+      setSelectedArchivePdfs(new Set());
+      setSelectedArchiveCodingTopics(new Set());
+      setSelectedArchiveCodingTasks(new Set());
+      setSelectedArchiveStudents(new Set());
+      setArchiveBulkConfirm(null);
+      setArchiveBulkReadOk(false);
+      const errN = data?.errors?.length ?? 0;
+      if (errN > 0) {
+        toast.error(data?.message || `${errN} element silinmədi`);
+      } else {
+        toast.success(data?.message || "Seçilmiş elementlər silindi");
+      }
+    },
+    onError: (err: { message?: string }) => {
+      toast.error(err?.message || "Toplu silmə alınmadı");
     },
   });
   const hardDeleteMutation = useMutation({
@@ -1132,6 +1096,7 @@ export default function TestsPage() {
       if (type === "pdf") return teacherApi.hardDeletePdf(id);
       if (type === "codingTopic") return teacherApi.hardDeleteCodingTopic(id);
       if (type === "codingTask") return teacherApi.hardDeleteCodingTask(id);
+      if (type === "student") return teacherApi.hardDeleteStudent(String(id));
       throw new Error("Unknown type");
     },
     onSuccess: (_data, variables) => {
@@ -1153,9 +1118,7 @@ export default function TestsPage() {
         queryClient.invalidateQueries({ queryKey: ["teacher", "archive"] });
       }
       setShowHardDeleteModal(null);
-      setHardDeleteStep(1);
-      setHardDeleteConfirm(false);
-      setHardDeleteTyped("");
+      setHardDeleteReadOk(false);
     },
     onError: (err: any) => {
       if (err?.response?.status === 409 && err?.response?.data?.code === "HAS_ATTEMPTS") {
@@ -1461,23 +1424,16 @@ export default function TestsPage() {
                         )}
                         {examComposition.counts && (
                           <div className="space-y-1 mt-1">
-                            {examDetail?.type === "exam" && "closed" in (examComposition.required || {}) ? (
-                              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
-                                <span className={examComposition.counts.closed === (examComposition.required as { closed: number }).closed ? "text-green-600 font-medium" : "text-orange-600"}>
-                                  Qapalı: {examComposition.counts.closed} / {(examComposition.required as { closed: number }).closed}
-                                </span>
-                                <span className={examComposition.counts.open === (examComposition.required as { open: number }).open ? "text-green-600 font-medium" : "text-orange-600"}>
-                                  Açıq: {examComposition.counts.open} / {(examComposition.required as { open: number }).open}
-                                </span>
-                                <span className={examComposition.counts.situation === (examComposition.required as { situation: number }).situation ? "text-green-600 font-medium" : "text-orange-600"}>
-                                  Situasiya: {examComposition.counts.situation} / {(examComposition.required as { situation: number }).situation}
-                                </span>
-                              </div>
-                            ) : (
-                              <p className="text-xs text-slate-600">
-                                Sual sayı: {examComposition.counts.closed + examComposition.counts.open + examComposition.counts.situation} (quiz üçün ən azı 1 tələb olunur)
-                              </p>
-                            )}
+                            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-700">
+                              <span>Qapalı: {examComposition.counts.closed}</span>
+                              <span>Açıq: {examComposition.counts.open}</span>
+                              <span>Situasiya: {examComposition.counts.situation}</span>
+                              <span className={examComposition.canActivate ? "text-green-600 font-medium" : "text-orange-600"}>
+                                Cəmi:{" "}
+                                {examComposition.counts.closed + examComposition.counts.open + examComposition.counts.situation}{" "}
+                                (ən azı 1)
+                              </span>
+                            </div>
                           </div>
                         )}
                         <div className="flex flex-wrap gap-2 mt-2 items-center">
@@ -2534,7 +2490,7 @@ export default function TestsPage() {
       {activeTab === "archive" && (
         <div className="space-y-6">
           <div className="flex flex-wrap gap-2 mb-4">
-            {(["exams", "questions", "topics", "pdfs", "codingTopics", "codingTasks"] as ArchiveSubTab[]).map((t) => (
+            {(["exams", "questions", "topics", "pdfs", "codingTopics", "codingTasks", "students"] as ArchiveSubTab[]).map((t) => (
               <button
                 key={t}
                 type="button"
@@ -2545,7 +2501,19 @@ export default function TestsPage() {
                     : "bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-200/80"
                 }`}
               >
-                {t === "exams" ? "İmtahanlar" : t === "questions" ? "Suallar" : t === "topics" ? "Sual mövzuları" : t === "pdfs" ? "PDFs" : t === "codingTopics" ? "Kod mövzuları" : "Kod tapşırıqları"}
+                {t === "exams"
+                  ? "İmtahanlar"
+                  : t === "questions"
+                    ? "Suallar"
+                    : t === "topics"
+                      ? "Sual mövzuları"
+                      : t === "pdfs"
+                        ? "PDFs"
+                        : t === "codingTopics"
+                          ? "Kod mövzuları"
+                          : t === "codingTasks"
+                            ? "Kod tapşırıqları"
+                            : "Şagirdlər"}
               </button>
             ))}
           </div>
@@ -2580,13 +2548,15 @@ export default function TestsPage() {
                     <button
                       type="button"
                       onClick={() => {
-                        if (confirm(`${selectedArchiveExams.size} seçilmiş imtahan silinsin?`)) {
-                          bulkDeleteExamsMutation.mutate(Array.from(selectedArchiveExams));
-                        }
+                        setArchiveBulkConfirm({
+                          category: "exam",
+                          ids: Array.from(selectedArchiveExams).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
                       }}
                       className="btn-outline text-sm text-red-600 border-red-200 hover:bg-red-50"
                     >
-                      {selectedArchiveExams.size} seçilmiş silinsin
+                      Sil ({selectedArchiveExams.size})
                     </button>
                   )}
                 </div>
@@ -2618,82 +2588,529 @@ export default function TestsPage() {
               </>
             )}
             {archiveSubTab === "questions" && archiveQuestionsData?.items && archiveQuestionsData.items.length > 0 && (
-              <ul className="space-y-2">
-                {archiveQuestionsData.items.map((q: QuestionBankItem) => (
-                  <li key={q.id} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
-                    <span className="line-clamp-2 text-slate-900 text-sm">
-                      <span className="font-medium">{formatBankQuestionPickerLine(q)}</span>
-                      <span className="block text-xs text-slate-600 line-clamp-1">{q.text}</span>
-                    </span>
-                    <div className="flex gap-2 shrink-0">
-                      <button type="button" onClick={() => teacherApi.restoreQuestion(typeof q.id === "number" ? q.id : Number(q.id)).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))} className="text-blue-600 hover:underline text-sm">Bərpa et</button>
-                      <button type="button" onClick={() => setShowHardDeleteModal({ type: "question", id: q.id, name: (q.short_title || q.text)?.slice(0, 50) || `Sual ${q.id}` })} className="text-red-600 hover:underline text-sm">Tam sil</button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {archiveSubTab === "topics" && archiveTopicsData?.items && archiveTopicsData.items.length > 0 && (
-              <ul className="space-y-2">
-                {archiveTopicsData.items.map((t: any) => (
-                  <li key={t.id} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
-                    <span className="font-medium text-slate-900">{t.name}</span>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => teacherApi.restoreQuestionTopic(typeof t.id === "number" ? t.id : Number(t.id)).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))} className="text-blue-600 hover:underline text-sm">Bərpa et</button>
-                      <button type="button" onClick={() => setShowHardDeleteModal({ type: "topic", id: t.id, name: t.name })} className="text-red-600 hover:underline text-sm">Tam sil</button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {archiveSubTab === "pdfs" && archivePdfsData?.items && archivePdfsData.items.length > 0 && (
-              <ul className="space-y-2">
-                {archivePdfsData.items.map((p: any) => (
-                  <li key={p.id} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
-                    <span className="font-medium text-slate-900">{p.title}</span>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => teacherApi.restorePdf(typeof p.id === "number" ? p.id : Number(p.id)).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))} className="text-blue-600 hover:underline text-sm">Bərpa et</button>
-                      <button type="button" onClick={() => setShowHardDeleteModal({ type: "pdf", id: p.id, name: p.title })} className="text-red-600 hover:underline text-sm">Tam sil</button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {archiveSubTab === "codingTopics" && archiveCodingTopicsData?.items && archiveCodingTopicsData.items.length > 0 && (
-              <ul className="space-y-2">
-                {archiveCodingTopicsData.items.map((t: { id: number; name: string }) => (
-                  <li key={t.id} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
-                    <span className="font-medium text-slate-900">{t.name}</span>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => teacherApi.restoreCodingTopic(t.id).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))} className="text-blue-600 hover:underline text-sm flex items-center gap-1"><RotateCcw className="w-3 h-3" /> Bərpa et</button>
-                      <button type="button" onClick={() => setShowHardDeleteModal({ type: "codingTopic", id: t.id, name: t.name })} className="text-red-600 hover:underline text-sm">Tam sil</button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {archiveSubTab === "codingTasks" && archiveCodingTasksData?.items && archiveCodingTasksData.items.length > 0 && (
-              <ul className="space-y-2">
-                {archiveCodingTasksData.items.map((t) => {
-                  const tid = typeof t.id === "string" ? parseInt(t.id, 10) : t.id;
-                  return (
-                    <li key={tid} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
-                      <span className="font-medium text-slate-900">{t.title}</span>
-                      <div className="flex gap-2">
-                        <button type="button" onClick={() => teacherApi.restoreCodingTask(tid).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))} className="text-blue-600 hover:underline text-sm flex items-center gap-1"><RotateCcw className="w-3 h-3" /> Bərpa et</button>
-                        <button type="button" onClick={() => setShowHardDeleteModal({ type: "codingTask", id: tid, name: t.title })} className="text-red-600 hover:underline text-sm">Tam sil</button>
+              <>
+                <div className="mb-4 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={
+                        archiveQuestionsData.items.every((q: QuestionBankItem) =>
+                          selectedArchiveQuestions.has(Number(q.id))
+                        ) && archiveQuestionsData.items.length > 0
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedArchiveQuestions(
+                            new Set(archiveQuestionsData.items.map((q: QuestionBankItem) => Number(q.id)))
+                          );
+                        } else {
+                          setSelectedArchiveQuestions(new Set());
+                        }
+                      }}
+                    />
+                    Hamısını seç
+                  </label>
+                  {selectedArchiveQuestions.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setArchiveBulkConfirm({
+                          category: "question",
+                          ids: Array.from(selectedArchiveQuestions).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
+                      }}
+                      className="btn-outline border-red-200 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Sil ({selectedArchiveQuestions.size})
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {archiveQuestionsData.items.map((q: QuestionBankItem) => (
+                    <li
+                      key={q.id}
+                      className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedArchiveQuestions.has(Number(q.id))}
+                        onChange={(e) => {
+                          const id = Number(q.id);
+                          const next = new Set(selectedArchiveQuestions);
+                          if (e.target.checked) next.add(id);
+                          else next.delete(id);
+                          setSelectedArchiveQuestions(next);
+                        }}
+                        className="cursor-pointer"
+                      />
+                      <span className="line-clamp-2 flex-1 text-sm text-slate-900">
+                        <span className="font-medium">{formatBankQuestionPickerLine(q)}</span>
+                        <span className="line-clamp-1 block text-xs text-slate-600">{q.text}</span>
+                      </span>
+                      <div className="flex shrink-0 gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            teacherApi
+                              .restoreQuestion(typeof q.id === "number" ? q.id : Number(q.id))
+                              .then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))
+                          }
+                          className="text-sm text-blue-600 hover:underline"
+                        >
+                          Bərpa et
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShowHardDeleteModal({
+                              type: "question",
+                              id: q.id,
+                              name: (q.short_title || q.text)?.slice(0, 50) || `Sual ${q.id}`,
+                            })
+                          }
+                          className="text-sm text-red-600 hover:underline"
+                        >
+                          Tam sil
+                        </button>
                       </div>
                     </li>
-                  );
-                })}
-              </ul>
+                  ))}
+                </ul>
+              </>
+            )}
+            {archiveSubTab === "topics" && archiveTopicsData?.items && archiveTopicsData.items.length > 0 && (
+              <>
+                <div className="mb-4 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={
+                        archiveTopicsData.items.every((t: { id: number }) => selectedArchiveTopics.has(Number(t.id))) &&
+                        archiveTopicsData.items.length > 0
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedArchiveTopics(
+                            new Set(archiveTopicsData.items.map((t: { id: number }) => Number(t.id)))
+                          );
+                        } else {
+                          setSelectedArchiveTopics(new Set());
+                        }
+                      }}
+                    />
+                    Hamısını seç
+                  </label>
+                  {selectedArchiveTopics.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setArchiveBulkConfirm({
+                          category: "topic",
+                          ids: Array.from(selectedArchiveTopics).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
+                      }}
+                      className="btn-outline border-red-200 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Sil ({selectedArchiveTopics.size})
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {archiveTopicsData.items.map((t: { id: number; name: string }) => (
+                    <li
+                      key={t.id}
+                      className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedArchiveTopics.has(Number(t.id))}
+                        onChange={(e) => {
+                          const id = Number(t.id);
+                          const next = new Set(selectedArchiveTopics);
+                          if (e.target.checked) next.add(id);
+                          else next.delete(id);
+                          setSelectedArchiveTopics(next);
+                        }}
+                        className="cursor-pointer"
+                      />
+                      <span className="flex-1 font-medium text-slate-900">{t.name}</span>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            teacherApi
+                              .restoreQuestionTopic(typeof t.id === "number" ? t.id : Number(t.id))
+                              .then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))
+                          }
+                          className="text-sm text-blue-600 hover:underline"
+                        >
+                          Bərpa et
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowHardDeleteModal({ type: "topic", id: t.id, name: t.name })}
+                          className="text-sm text-red-600 hover:underline"
+                        >
+                          Tam sil
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {archiveSubTab === "pdfs" && archivePdfsData?.items && archivePdfsData.items.length > 0 && (
+              <>
+                <div className="mb-4 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={
+                        archivePdfsData.items.every((p: { id: number }) => selectedArchivePdfs.has(Number(p.id))) &&
+                        archivePdfsData.items.length > 0
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedArchivePdfs(
+                            new Set(archivePdfsData.items.map((p: { id: number }) => Number(p.id)))
+                          );
+                        } else {
+                          setSelectedArchivePdfs(new Set());
+                        }
+                      }}
+                    />
+                    Hamısını seç
+                  </label>
+                  {selectedArchivePdfs.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setArchiveBulkConfirm({
+                          category: "pdf",
+                          ids: Array.from(selectedArchivePdfs).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
+                      }}
+                      className="btn-outline border-red-200 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Sil ({selectedArchivePdfs.size})
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {archivePdfsData.items.map((p: { id: number; title: string }) => (
+                    <li
+                      key={p.id}
+                      className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedArchivePdfs.has(Number(p.id))}
+                        onChange={(e) => {
+                          const id = Number(p.id);
+                          const next = new Set(selectedArchivePdfs);
+                          if (e.target.checked) next.add(id);
+                          else next.delete(id);
+                          setSelectedArchivePdfs(next);
+                        }}
+                        className="cursor-pointer"
+                      />
+                      <span className="flex-1 font-medium text-slate-900">{p.title}</span>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            teacherApi
+                              .restorePdf(typeof p.id === "number" ? p.id : Number(p.id))
+                              .then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))
+                          }
+                          className="text-sm text-blue-600 hover:underline"
+                        >
+                          Bərpa et
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowHardDeleteModal({ type: "pdf", id: p.id, name: p.title })}
+                          className="text-sm text-red-600 hover:underline"
+                        >
+                          Tam sil
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {archiveSubTab === "codingTopics" && archiveCodingTopicsData?.items && archiveCodingTopicsData.items.length > 0 && (
+              <>
+                <div className="mb-4 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={
+                        archiveCodingTopicsData.items.every((t: { id: number }) =>
+                          selectedArchiveCodingTopics.has(Number(t.id))
+                        ) && archiveCodingTopicsData.items.length > 0
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedArchiveCodingTopics(
+                            new Set(archiveCodingTopicsData.items.map((t: { id: number }) => Number(t.id)))
+                          );
+                        } else {
+                          setSelectedArchiveCodingTopics(new Set());
+                        }
+                      }}
+                    />
+                    Hamısını seç
+                  </label>
+                  {selectedArchiveCodingTopics.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setArchiveBulkConfirm({
+                          category: "coding_topic",
+                          ids: Array.from(selectedArchiveCodingTopics).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
+                      }}
+                      className="btn-outline border-red-200 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Sil ({selectedArchiveCodingTopics.size})
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {archiveCodingTopicsData.items.map((t: { id: number; name: string }) => (
+                    <li
+                      key={t.id}
+                      className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedArchiveCodingTopics.has(Number(t.id))}
+                        onChange={(e) => {
+                          const id = Number(t.id);
+                          const next = new Set(selectedArchiveCodingTopics);
+                          if (e.target.checked) next.add(id);
+                          else next.delete(id);
+                          setSelectedArchiveCodingTopics(next);
+                        }}
+                        className="cursor-pointer"
+                      />
+                      <span className="flex-1 font-medium text-slate-900">{t.name}</span>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            teacherApi.restoreCodingTopic(t.id).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))
+                          }
+                          className="flex items-center gap-1 text-sm text-blue-600 hover:underline"
+                        >
+                          <RotateCcw className="h-3 w-3" /> Bərpa et
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowHardDeleteModal({ type: "codingTopic", id: t.id, name: t.name })}
+                          className="text-sm text-red-600 hover:underline"
+                        >
+                          Tam sil
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {archiveSubTab === "codingTasks" && archiveCodingTasksData?.items && archiveCodingTasksData.items.length > 0 && (
+              <>
+                <div className="mb-4 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={
+                        archiveCodingTasksData.items.every((t: { id: number | string }) => {
+                          const tid = typeof t.id === "string" ? parseInt(t.id, 10) : t.id;
+                          return selectedArchiveCodingTasks.has(tid);
+                        }) && archiveCodingTasksData.items.length > 0
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedArchiveCodingTasks(
+                            new Set(
+                              archiveCodingTasksData.items.map((t: { id: number | string }) =>
+                                typeof t.id === "string" ? parseInt(t.id, 10) : t.id
+                              )
+                            )
+                          );
+                        } else {
+                          setSelectedArchiveCodingTasks(new Set());
+                        }
+                      }}
+                    />
+                    Hamısını seç
+                  </label>
+                  {selectedArchiveCodingTasks.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setArchiveBulkConfirm({
+                          category: "coding_task",
+                          ids: Array.from(selectedArchiveCodingTasks).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
+                      }}
+                      className="btn-outline border-red-200 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Sil ({selectedArchiveCodingTasks.size})
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {archiveCodingTasksData.items.map((t: { id: number | string; title: string }) => {
+                    const tid = typeof t.id === "string" ? parseInt(t.id, 10) : t.id;
+                    return (
+                      <li
+                        key={tid}
+                        className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedArchiveCodingTasks.has(tid)}
+                          onChange={(e) => {
+                            const next = new Set(selectedArchiveCodingTasks);
+                            if (e.target.checked) next.add(tid);
+                            else next.delete(tid);
+                            setSelectedArchiveCodingTasks(next);
+                          }}
+                          className="cursor-pointer"
+                        />
+                        <span className="flex-1 font-medium text-slate-900">{t.title}</span>
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              teacherApi.restoreCodingTask(tid).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))
+                            }
+                            className="flex items-center gap-1 text-sm text-blue-600 hover:underline"
+                          >
+                            <RotateCcw className="h-3 w-3" /> Bərpa et
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setShowHardDeleteModal({ type: "codingTask", id: tid, name: t.title })}
+                            className="text-sm text-red-600 hover:underline"
+                          >
+                            Tam sil
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
+            )}
+            {archiveSubTab === "students" && archiveStudentsData?.items && archiveStudentsData.items.length > 0 && (
+              <>
+                <div className="mb-4 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={
+                        archiveStudentsData.items.every((s: Student) =>
+                          selectedArchiveStudents.has(Number(s.id))
+                        ) && archiveStudentsData.items.length > 0
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedArchiveStudents(
+                            new Set(archiveStudentsData.items.map((s: Student) => Number(s.id)))
+                          );
+                        } else {
+                          setSelectedArchiveStudents(new Set());
+                        }
+                      }}
+                    />
+                    Hamısını seç
+                  </label>
+                  {selectedArchiveStudents.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setArchiveBulkConfirm({
+                          category: "student",
+                          ids: Array.from(selectedArchiveStudents).map((id) => Number(id)),
+                        });
+                        setArchiveBulkReadOk(false);
+                      }}
+                      className="btn-outline border-red-200 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Sil ({selectedArchiveStudents.size})
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {archiveStudentsData.items.map((s: Student) => {
+                    const sid = Number(s.id);
+                    return (
+                      <li
+                        key={sid}
+                        className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedArchiveStudents.has(sid)}
+                          onChange={(e) => {
+                            const next = new Set(selectedArchiveStudents);
+                            if (e.target.checked) next.add(sid);
+                            else next.delete(sid);
+                            setSelectedArchiveStudents(next);
+                          }}
+                          className="cursor-pointer"
+                        />
+                        <span className="flex-1 text-sm font-medium text-slate-900">
+                          {s.fullName}{" "}
+                          <span className="block text-xs font-normal text-slate-500">{s.email}</span>
+                        </span>
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              teacherApi.restoreStudent(s.id).then(() => queryClient.invalidateQueries({ queryKey: ["teacher"] }))
+                            }
+                            className="text-sm text-blue-600 hover:underline"
+                          >
+                            Bərpa et
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setShowHardDeleteModal({
+                                type: "student",
+                                id: sid,
+                                name: s.fullName || s.email || `Şagird ${sid}`,
+                              })
+                            }
+                            className="text-sm text-red-600 hover:underline"
+                          >
+                            Tam sil
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
             )}
             {((archiveSubTab === "exams" && (!archiveExamsData?.items || archiveExamsData.items.length === 0)) ||
               (archiveSubTab === "questions" && (!archiveQuestionsData?.items || archiveQuestionsData.items.length === 0)) ||
               (archiveSubTab === "topics" && (!archiveTopicsData?.items || archiveTopicsData.items.length === 0)) ||
               (archiveSubTab === "pdfs" && (!archivePdfsData?.items || archivePdfsData.items.length === 0)) ||
               (archiveSubTab === "codingTopics" && (!archiveCodingTopicsData?.items || archiveCodingTopicsData.items.length === 0)) ||
-              (archiveSubTab === "codingTasks" && (!archiveCodingTasksData?.items || archiveCodingTasksData.items.length === 0))) && (
+              (archiveSubTab === "codingTasks" && (!archiveCodingTasksData?.items || archiveCodingTasksData.items.length === 0)) ||
+              (archiveSubTab === "students" && (!archiveStudentsData?.items || archiveStudentsData.items.length === 0))) && (
               <p className="text-slate-500 py-8 text-center">Arxivdə element tapılmadı</p>
             )}
           </div>
@@ -2759,33 +3176,27 @@ export default function TestsPage() {
             };
             if (createExamSource === "BANK") {
               payload.source_type = "BANK";
-            } else if (createExamSource === "JSON") {
-              let ak: Record<string, unknown>;
-              try {
-                ak = JSON.parse(createExamJson) as Record<string, unknown>;
-              } catch {
-                setCreateExamJsonError("JSON formatı səhvdir");
-                return;
-              }
-              payload.source_type = "JSON";
-              payload.answer_key_json = ak;
-              payload.type = (ak.type as "quiz" | "exam") || v.type;
             } else {
-              let ak: Record<string, unknown>;
+              let parsed: unknown;
               try {
-                ak = JSON.parse(createExamJson) as Record<string, unknown>;
+                parsed = JSON.parse(createExamJson);
               } catch {
-                setCreateExamJsonError(createExamSource === "PDF" ? "Cavab vərəqi JSON formatı səhvdir" : "Sual və cavablar JSON formatı səhvdir");
+                setCreateExamJsonError("Cavab vərəqi JSON formatı səhvdir");
                 return;
               }
               if (!createExamPdfId) {
                 setCreateExamJsonError("PDF seçin");
                 return;
               }
+              const res = validateAndNormalizeAnswerKeyJson(parsed);
+              if (!res.ok || !res.normalized) {
+                setCreateExamJsonError(res.errors.join(" · "));
+                return;
+              }
               payload.source_type = "PDF";
-              payload.answer_key_json = ak;
+              payload.answer_key_json = res.normalized as Record<string, unknown>;
               payload.pdf_id = createExamPdfId;
-              payload.type = (ak.type as "quiz" | "exam") || v.type;
+              payload.type = ((res.normalized.type as "quiz" | "exam") || v.type) as "quiz" | "exam";
             }
             createExamMutation.mutate(payload);
           })}
@@ -2796,10 +3207,16 @@ export default function TestsPage() {
             <select
               className="input"
               value={createExamSource}
-              onChange={(e) => setCreateExamSource(e.target.value as "BANK" | "JSON" | "PDF")}
+              onChange={(e) => {
+                const v = e.target.value as "BANK" | "PDF";
+                setCreateExamSource(v);
+                setCreateExamJsonError(null);
+                if (v === "PDF") {
+                  setCreateExamJson((prev) => (prev.trim() ? prev : PDF_EXAM_ANSWER_KEY_TEMPLATE));
+                }
+              }}
             >
-              <option value="BANK">Sual bankı</option>
-              <option value="JSON">JSON</option>
+              <option value="BANK">Hazır suallar</option>
               <option value="PDF">PDF + Cavab vərəqi</option>
             </select>
           </div>
@@ -2869,38 +3286,54 @@ export default function TestsPage() {
               <p className="mt-1 text-xs text-slate-500">Əvvəlcə PDF kitabxanasına yükləyin (PDFs sekmesi)</p>
             </div>
           )}
-          {(createExamSource === "JSON" || createExamSource === "PDF") && (
+          {createExamSource === "PDF" && (
             <div>
-              <label className="label">{createExamSource === "PDF" ? "Cavab vərəqi (JSON)" : "Sual və Cavablar (JSON)"}</label>
-              <textarea
-                className="input min-h-[120px] font-mono text-sm"
-                placeholder='{"type":"exam","questions":[{"number":1,"kind":"mc","options":[{"key":"A","text":"Variant A mətni"},{"key":"B","text":"Variant B"},{"key":"C","text":"Variant C"},{"key":"D","text":"Variant D"},{"key":"E","text":"Variant E"}],"correct":"A"},{"number":2,"kind":"open","prompt":"Açıq sual mətni"},{"number":23,"kind":"situation","prompt":"Situasiya sualı"}]}'
+              <label className="label">Cavab vərəqi (JSON)</label>
+              <CodeEditor
                 value={createExamJson}
-                onChange={(e) => {
-                  setCreateExamJson(e.target.value);
+                onChange={(v) => {
+                  setCreateExamJson(v);
                   setCreateExamJsonError(null);
                 }}
+                minHeight="360px"
+                tabSize={2}
+                templateCode={PDF_EXAM_ANSWER_KEY_TEMPLATE}
+                showToolbar
+                showCopyButton={false}
+                placeholder='{"type":"exam","questions":[{"no":1,"qtype":"closed",...}]}'
               />
               {createExamJsonError && (
                 <p className="mt-1 text-xs text-red-600">{createExamJsonError}</p>
               )}
               {createExamJson.trim() && (() => {
                 try {
-                  const q = JSON.parse(createExamJson) as { type?: string; questions?: { qtype?: string; kind?: string }[] };
-                  const qs = q?.questions ?? [];
-                  const closed = qs.filter((x) => (x.qtype || x.kind || "").toString().toLowerCase() === "closed" || (x.qtype || x.kind) === "mc").length;
-                  const open = qs.filter((x) => (x.qtype || x.kind || "").toString().toLowerCase() === "open").length;
-                  const sit = qs.filter((x) => (x.qtype || x.kind || "").toString().toLowerCase() === "situation").length;
-                  const isQuiz = (q.type || "quiz") === "quiz";
-                  const total = closed + open + sit;
-                  const ok = isQuiz ? total >= 1 : (closed === 22 && open === 5 && sit === 3);
+                  const parsed = JSON.parse(createExamJson) as unknown;
+                  const res = validateAndNormalizeAnswerKeyJson(parsed);
+                  if (res.ok && res.normalized) {
+                    const qs = (res.normalized.questions ?? []) as { kind?: string }[];
+                    const closed = qs.filter((x) => x.kind === "mc").length;
+                    const open = qs.filter((x) => x.kind === "open").length;
+                    const sit = qs.filter((x) => x.kind === "situation").length;
+                    const isQuiz = res.normalized.type === "quiz";
+                    const total = closed + open + sit;
+                    const ok = total >= 1;
+                    return (
+                      <p className={`mt-1 text-xs ${ok ? "text-green-600" : "text-amber-600"}`}>
+                        Normalizasiya: qapalı {closed}, açıq {open}, situasiya {sit} (cəmi {total}).{" "}
+                        {isQuiz ? "Quiz" : "İmtahan"}: ən azı 1 sual.{" "}
+                        {ok ? "Backend qaydalarına uyğundur." : "Ən azı bir sual əlavə edin."}
+                      </p>
+                    );
+                  }
                   return (
-                    <p className={`mt-1 text-xs ${ok ? "text-green-600" : "text-amber-600"}`}>
-                      Sual sayı: qapalı {closed}, açıq {open}, situasiya {sit}. {isQuiz ? "Quiz: ən azı 1 sual" : "İmtahan: tam 30 (22+5+3)"}. {ok ? "Düzgündür" : "Tərkib qaydalarına uyğun yoxlayın."}
-                    </p>
+                    <ul className="mt-1 list-inside list-disc text-xs text-red-600 max-h-48 overflow-y-auto">
+                      {res.errors.map((err, i) => (
+                        <li key={i}>{err}</li>
+                      ))}
+                    </ul>
                   );
                 } catch {
-                  return null;
+                  return <p className="mt-1 text-xs text-amber-600">JSON sintaksisi yoxlanılır…</p>;
                 }
               })()}
             </div>
@@ -2955,8 +3388,6 @@ export default function TestsPage() {
               </div>
             </div>
             {(() => {
-              const isQuiz = examDetail?.type === "quiz";
-              const req = isQuiz ? null : { closed: 22, open: 5, situation: 3, total: 30 };
               const current = {
                 closed: (examDetail?.questions ?? []).filter((q: any) => q.question_type === "MULTIPLE_CHOICE").length,
                 open: (examDetail?.questions ?? []).filter((q: any) => (q.question_type || "").startsWith("OPEN")).length,
@@ -2970,14 +3401,12 @@ export default function TestsPage() {
               };
               const after = { closed: current.closed + sel.closed, open: current.open + sel.open, situation: current.situation + sel.situation };
               const afterTotal = after.closed + after.open + after.situation;
-              const valid = isQuiz
-                ? afterTotal >= 1
-                : req && after.closed <= req.closed && after.open <= req.open && after.situation <= req.situation && afterTotal <= req.total;
+              const valid = afterTotal >= 1;
               return (
                 <>
                   <div className="text-xs text-slate-600 mb-2">
-                    {isQuiz ? "Quiz: istənilən sayda sual (ən azı 1)" : "İmtahan: tam 30 sual (22 qapalı + 5 açıq + 3 situasiya)"}. Əlavədən sonra: Qapalı {after.closed}{req ? `/${req.closed}` : ""}, Açıq {after.open}{req ? `/${req.open}` : ""}{req ? `, Situasiya ${after.situation}/${req.situation}` : ""}
-                    {!valid && addQuestionIds.length > 0 && <span className="block text-red-600 mt-1">Sual sayı qaydalara uyğun deyil</span>}
+                    Bank imtahanı: dinamik sual sayı (ən azı 1). Əlavədən sonra: Qapalı {after.closed}, Açıq {after.open}, Situasiya {after.situation} (cəmi {afterTotal})
+                    {!valid && addQuestionIds.length > 0 && <span className="block text-red-600 mt-1">Ən azı bir sual olmalıdır</span>}
                   </div>
                   <div className="max-h-64 overflow-y-auto space-y-2 mb-4">
                     {questionsForExam
@@ -3292,62 +3721,86 @@ export default function TestsPage() {
 
       <Modal
         isOpen={!!showHardDeleteModal}
-        onClose={() => { setShowHardDeleteModal(null); setHardDeleteStep(1); setHardDeleteConfirm(false); setHardDeleteTyped(""); }}
+        onClose={() => {
+          setShowHardDeleteModal(null);
+          setHardDeleteReadOk(false);
+        }}
         title="Tam sil (geri qaytarmaq olmaz)"
         size="sm"
       >
         {showHardDeleteModal && (
           <div className="space-y-4">
-            {hardDeleteStep === 1 ? (
-              <>
-                <p className="text-slate-600">Bu əməliyyat geri alına bilməz. Davam etmək üçün təsdiq edin.</p>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={hardDeleteConfirm}
-                    onChange={(e) => setHardDeleteConfirm(e.target.checked)}
-                  />
-                  <span>Başa düşürəm, geri qaytarmaq olmaz</span>
-                </label>
-                <div className="flex gap-3 justify-end">
-                  <button type="button" onClick={() => setShowHardDeleteModal(null)} className="btn-outline">Ləğv et</button>
-                  <button
-                    type="button"
-                    onClick={() => hardDeleteConfirm && setHardDeleteStep(2)}
-                    disabled={!hardDeleteConfirm}
-                    className="btn-primary text-red-700 border-red-300 hover:bg-red-50"
-                  >
-                    Növbəti
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <p className="text-slate-600">Təsdiq üçün <strong>DELETE</strong> və ya element adını yazın: &quot;{showHardDeleteModal.name}&quot;</p>
-                <input
-                  type="text"
-                  className="input w-full"
-                  placeholder="DELETE və ya element adı"
-                  value={hardDeleteTyped}
-                  onChange={(e) => setHardDeleteTyped(e.target.value)}
-                />
-                <div className="flex gap-3 justify-end">
-                  <button type="button" onClick={() => setHardDeleteStep(1)} className="btn-outline">Geri</button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (hardDeleteTyped === "DELETE" || hardDeleteTyped === showHardDeleteModal.name) {
-                        hardDeleteMutation.mutate({ type: showHardDeleteModal.type, id: showHardDeleteModal.id });
-                      }
-                    }}
-                    disabled={hardDeleteTyped !== "DELETE" && hardDeleteTyped !== showHardDeleteModal.name || hardDeleteMutation.isPending}
-                    className="btn-primary text-red-700 border-red-300 hover:bg-red-50"
-                  >
-                    {hardDeleteMutation.isPending ? "Silinir…" : "Tam sil"}
-                  </button>
-                </div>
-              </>
-            )}
+            <p className="text-slate-600">
+              &quot;{showHardDeleteModal.name}&quot; əbədi silinəcək. Bu əməliyyat geri alına bilməz.
+            </p>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input type="checkbox" checked={hardDeleteReadOk} onChange={(e) => setHardDeleteReadOk(e.target.checked)} />
+              <span>Mən bu məlumatların silinməsinə razıyam</span>
+            </label>
+            <div className="flex justify-end gap-3">
+              <button type="button" onClick={() => setShowHardDeleteModal(null)} className="btn-outline">
+                Ləğv et
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!hardDeleteReadOk) return;
+                  hardDeleteMutation.mutate({ type: showHardDeleteModal.type, id: showHardDeleteModal.id });
+                }}
+                disabled={!hardDeleteReadOk || hardDeleteMutation.isPending}
+                className="btn-primary border-red-300 text-red-700 hover:bg-red-50"
+              >
+                {hardDeleteMutation.isPending ? "Silinir…" : "Təsdiqlə"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        isOpen={archiveBulkConfirm != null && archiveBulkConfirm.ids.length > 0}
+        onClose={() => {
+          setArchiveBulkConfirm(null);
+          setArchiveBulkReadOk(false);
+        }}
+        title="Seçilmişləri sil"
+        size="sm"
+      >
+        {archiveBulkConfirm != null && archiveBulkConfirm.ids.length > 0 && (
+          <div className="space-y-4">
+            <p className="text-slate-600">
+              <strong>{archiveBulkConfirm.ids.length}</strong> element əbədi silinəcək. Bu əməliyyat geri alına bilməz.
+            </p>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input type="checkbox" checked={archiveBulkReadOk} onChange={(e) => setArchiveBulkReadOk(e.target.checked)} />
+              <span>Mən bu məlumatların silinməsinə razıyam</span>
+            </label>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setArchiveBulkConfirm(null);
+                  setArchiveBulkReadOk(false);
+                }}
+                className="btn-outline"
+              >
+                Ləğv et
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!archiveBulkReadOk || !archiveBulkConfirm?.ids.length) return;
+                  archiveBulkDeleteMutation.mutate({
+                    category: archiveBulkConfirm.category,
+                    ids: archiveBulkConfirm.ids,
+                  });
+                }}
+                disabled={!archiveBulkReadOk || archiveBulkDeleteMutation.isPending}
+                className="btn-primary border-red-300 text-red-700 hover:bg-red-50"
+              >
+                {archiveBulkDeleteMutation.isPending ? "Silinir…" : "Təsdiqlə"}
+              </button>
+            </div>
           </div>
         )}
       </Modal>
@@ -3782,37 +4235,12 @@ export default function TestsPage() {
                             const pts = Number((chipValue * xUnit).toFixed(2));
                             setSituationManualScores((prev) => ({ ...prev, [sid]: pts }));
                             setManualScores((prev) => ({ ...prev, [sid]: pts }));
-                            if (ans.id != null && situationIndex > 0) {
-                              void handleSaveSituation({
-                                answerId: ans.id,
-                                examRunId: attemptDetail?.runId ?? null,
-                                situationIndex,
-                                score: pts,
-                                sourceType: attemptDetail.sourceType,
-                              });
-                            }
                           }}
                           onScoreChange={(value) => {
                             const sid = String(ans.id);
                             setManualScores((prev) => ({ ...prev, [sid]: value }));
                             setSituationManualScores((prev) => ({ ...prev, [sid]: value }));
                           }}
-                          onSave={() => {
-                            const sid = String(ans.id);
-                            const score = situationManualScores[sid] ?? manualScores[sid] ?? (ans.manualScore ?? undefined);
-                            if (ans.id == null || situationIndex <= 0 || typeof score !== "number" || Number.isNaN(score)) {
-                              toast.info("Əvvəlcə bal daxil edin");
-                              return;
-                            }
-                            void handleSaveSituation({
-                              answerId: ans.id,
-                              examRunId: attemptDetail?.runId ?? null,
-                              situationIndex,
-                              score,
-                              sourceType: attemptDetail.sourceType,
-                            });
-                          }}
-                          saveStatus={situationSaveState[String(ans.id)] ?? "idle"}
                           onOpenPreview={() => {
                             const preview = mainCanvasSnapshot ?? "";
                             setCanvasPreviewUrl(preview);
@@ -3954,7 +4382,7 @@ export default function TestsPage() {
                       disabled={bitirDisabled}
                       className="btn-primary flex-1"
                     >
-                      Bitir
+                      {gradeAttemptMutation.isPending ? "Saxlanılır…" : "Bitir"}
                     </button>
                     <button
                       type="button"

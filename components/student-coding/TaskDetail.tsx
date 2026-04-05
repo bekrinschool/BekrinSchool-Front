@@ -113,6 +113,9 @@ export function TaskDetail({ taskId, code, onCodeChange, onClose }: TaskDetailPr
         onChange={onCodeChange}
         placeholder={taskDetail.starterCode || "Kodunuzu yazın..."}
         minHeight="280px"
+        tabSize={2}
+        templateCode={taskDetail.starterCode || ""}
+        showToolbar
       />
 
       <div className="flex flex-wrap gap-4 items-start">

@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { studentApi } from "@/lib/student";
+import { formatMcSelectionForDisplay } from "@/lib/mc-option-display";
 import { Loading } from "@/components/Loading";
 import { UniversalLatex } from "@/components/common/MathContent";
 import { Check, X, ArrowLeft } from "lucide-react";
@@ -48,6 +49,7 @@ export default function StudentResultDigitalCopyPage() {
           <div className="space-y-3">
             {questions.map((q: any, i: number) => {
               const hasOptions = Array.isArray(q.options) && q.options.length > 0;
+              const blueprintOpts = Array.isArray(q.options) ? q.options : undefined;
               const pts = typeof q.points === "number" ? q.points : 0;
               const isCorrect = pts > 0;
               const blockClass = isCorrect ? "border-emerald-300 bg-emerald-50" : "border-rose-300 bg-rose-50";
@@ -108,11 +110,17 @@ export default function StudentResultDigitalCopyPage() {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
                       <div className="rounded-md border border-slate-200 bg-white p-2">
                         <p className="text-xs text-slate-500 mb-1">Sizin cavab</p>
-                        <UniversalLatex content={q.yourAnswer ?? "—"} className="whitespace-pre-wrap" />
+                        <UniversalLatex
+                          content={formatMcSelectionForDisplay(q.yourAnswer, blueprintOpts)}
+                          className="whitespace-pre-wrap"
+                        />
                       </div>
                       <div className="rounded-md border border-emerald-200 bg-emerald-50 p-2">
                         <p className="text-xs text-emerald-700 mb-1">Düzgün cavab</p>
-                        <UniversalLatex content={q.correctAnswer ?? "—"} className="whitespace-pre-wrap" />
+                        <UniversalLatex
+                          content={formatMcSelectionForDisplay(q.correctAnswer, blueprintOpts)}
+                          className="whitespace-pre-wrap"
+                        />
                       </div>
                     </div>
                   )}

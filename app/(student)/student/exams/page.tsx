@@ -6,6 +6,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { studentApi } from "@/lib/student";
 import { Loading } from "@/components/Loading";
 import { Modal } from "@/components/Modal";
+import { PortalDialog } from "@/components/PortalDialog";
 import { AutoExpandTextarea } from "@/components/exam/AutoExpandTextarea";
 import { SituationSmartCard } from "@/components/exam/SituationSmartCard";
 import { UniversalLatex } from "@/components/common/MathContent";
@@ -13,8 +14,12 @@ import { ExamWaitingScreen } from "@/components/student/ExamWaitingScreen";
 import { useToast } from "@/components/Toast";
 import { useExamRun } from "@/lib/exam-run-context";
 import { Send, Clock, AlertCircle, Maximize2 } from "lucide-react";
-import type { ImageExamViewerRef } from "@/components/exam/ImageExamViewer";
-import { ImageExamViewer } from "@/components/exam/ImageExamViewer";
+import type { PdfExamTakerRef } from "@/components/exam/PdfExamTaker";
+import {
+  PdfExamTaker,
+  clearPdfAttemptAnswersLocalStorage,
+  clearPdfScratchpadLocalStorage,
+} from "@/components/exam/PdfExamTaker";
 import { normalizeAnswer, normalizeMatchingAnswer, subTypeFromRule } from "@/lib/answer-normalizer";
 
 const EXAM_RUN_STORAGE_KEY = "exam_run_state";
@@ -70,6 +75,7 @@ type StartedQuestion = {
   text: string;
   type: string;
   kind?: string;
+  qtype?: string;
   prompt?: string;
   questionImageUrl?: string | null;
   mcOptionDisplay?: string;
@@ -224,6 +230,8 @@ export default function StudentExamsPage() {
   const [startedExam, setStartedExam] = useState<{
     attemptId: number;
     examId: number;
+    /** Server exam.type — sent on submit for API parity */
+    examType?: "quiz" | "exam";
     runId?: number;
     title: string;
     endTime: string;
@@ -237,12 +245,19 @@ export default function StudentExamsPage() {
     pdfScribbles?: { pageIndex: number; drawingData: Record<string, unknown> }[] | null;
     sessionRevision?: number;
     resumeQuestionIndex?: number;
+    /** PDF taker: server draft rows from last start (hydrate before GET /state) */
+    savedAnswersBootstrap?: Array<{
+      questionId?: number;
+      questionNumber?: number;
+      selectedOptionId?: number | string;
+      selectedOptionKey?: string;
+      textAnswer?: string;
+    }>;
   } | null>(null);
-  const examRunnerRef = useRef<ImageExamViewerRef>(null);
+  const pdfExamTakerRef = useRef<PdfExamTakerRef>(null);
   const [answers, setAnswers] = useState<Record<string, { selectedOptionId?: number | string; selectedOptionKey?: string; textAnswer?: string }>>({});
   const [submitted, setSubmitted] = useState<boolean>(false);
   const [cheatingModalOpen, setCheatingModalOpen] = useState(false);
-  const [suspendedModalOpen, setSuspendedModalOpen] = useState(false);
   const [isInternalModalOpen, setIsInternalModalOpen] = useState(false);
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [expired, setExpired] = useState(false);
@@ -259,8 +274,9 @@ export default function StudentExamsPage() {
   const submitInFlightRef = useRef(false);
   const prevFullscreenElementRef = useRef<Element | null>(null);
   const plannedExitRef = useRef(false);
+  /** True during manual Göndər flow — fullscreen exit must not trigger anti-cheat auto-submit. */
+  const isManualSubmitting = useRef(false);
   const pendingRestoreRef = useRef<{ attemptId: number; answers: Record<string, { selectedOptionId?: number | string; selectedOptionKey?: string; textAnswer?: string }> } | null>(null);
-  const suspendingRef = useRef(false);
   const serverTimeOffsetMsRef = useRef(0);
   const sessionRevisionRef = useRef(0);
   const startedExamRef = useRef(startedExam);
@@ -352,8 +368,13 @@ export default function StudentExamsPage() {
 
     const saveCurrentState = async () => {
       try {
-        if (examRunnerRef.current?.saveAllSituasiyaCanvases) {
-          await examRunnerRef.current.saveAllSituasiyaCanvases();
+        if (pdfExamTakerRef.current?.persistDraftAndScratchpad) {
+          await pdfExamTakerRef.current.persistDraftAndScratchpad();
+        } else if (pdfExamTakerRef.current?.flushScribbles) {
+          await pdfExamTakerRef.current.flushScribbles();
+        }
+        if (pdfExamTakerRef.current?.saveAllSituasiyaCanvases) {
+          await pdfExamTakerRef.current.saveAllSituasiyaCanvases();
         }
         const pendingSaves = Array.from(finalSituationSaveHooksRef.current.values()).map((fn) => fn());
         if (pendingSaves.length > 0) {
@@ -363,11 +384,22 @@ export default function StudentExamsPage() {
         // best-effort state save
       }
     };
-    const forceCheatingSubmit = () => {
-      if (cheatingSubmittingRef.current) return;
-      cheatingSubmittingRef.current = true;
-      setCheatingModalOpen(true);
-      submitMutationRef.current?.mutate({ cheatingDetected: true });
+    /**
+     * Anti-cheat: scoped to this browser session / authenticated student only.
+     * Persists local progress and submits with cheating_detected — no broadcast to other participants.
+     */
+    const handleViolation = () => {
+      void (async () => {
+        if (cheatingSubmittingRef.current) return;
+        cheatingSubmittingRef.current = true;
+        setCheatingModalOpen(true);
+        try {
+          await saveCurrentState();
+        } catch {
+          /* best-effort */
+        }
+        submitMutationRef.current?.mutate({ cheatingDetected: true });
+      })();
     };
     const isSituationModalOpen = () =>
       !!document.querySelector('[data-situation-fullscreen="true"]');
@@ -386,47 +418,19 @@ export default function StudentExamsPage() {
       const examEl = examContainerRef.current;
       const wasExamFullscreen = prev != null && examEl != null && prev === examEl;
       const isExamFullscreenNow = current != null && examEl != null && current === examEl;
-      if (wasExamFullscreen && !isExamFullscreenNow) {
-        forceCheatingSubmit();
+      if (
+        wasExamFullscreen &&
+        !isExamFullscreenNow &&
+        document.fullscreenElement === null &&
+        !isManualSubmitting.current
+      ) {
+        handleViolation();
       }
     };
     const onVisibilityChange = () => {
       if (document.hidden !== true || plannedExitRef.current) return;
-      const suspendNow = async () => {
-        if (suspendingRef.current) return;
-        suspendingRef.current = true;
-        setSuspendedModalOpen(true);
-        await saveCurrentState();
-        const ex = startedExamRef.current;
-        const ans = answersRef.current;
-        if (!ex) return;
-        try {
-          const answersList = ex.questions.map((q) => {
-            const key = getAnswerKey(q);
-            const a = ans[key];
-            return {
-              questionId: q.questionId,
-              questionNumber: q.questionNumber,
-              selectedOptionId: a?.selectedOptionId ?? null,
-              selectedOptionKey: a?.selectedOptionKey,
-              textAnswer: a?.textAnswer ?? "",
-            };
-          });
-          await studentApi.suspendExam({
-            runId: ex.runId ?? 0,
-            attemptId: ex.attemptId,
-            answers: answersList,
-          });
-        } catch {
-          // best-effort; UI is still locked out
-        } finally {
-          setExamRunning(false);
-          setStartedExam(null);
-          queryClient.invalidateQueries({ queryKey: ["student", "exams"] });
-          queryClient.invalidateQueries({ queryKey: ["teacher", "grading-attempts"] });
-        }
-      };
-      void suspendNow();
+      if (isManualSubmitting.current) return;
+      handleViolation();
     };
     const onSituationFullscreenChange = (e: Event) => {
       const ce = e as CustomEvent<{ open?: boolean }>;
@@ -519,6 +523,8 @@ export default function StudentExamsPage() {
       try {
         const ex = startedExamRef.current;
         if (!ex || ex.questions.length === 0) return;
+        const isPdf = (ex.sourceType || "").toUpperCase() === "PDF" || !!ex.pdfUrl;
+        if (isPdf) return;
         const payload = {
           attemptId: ex.attemptId,
           examId: ex.examId,
@@ -661,6 +667,7 @@ export default function StudentExamsPage() {
         setStartedExam({
           attemptId: data.attemptId,
           examId: data.examId,
+          examType: (data as { type?: string }).type === "quiz" || (data as { type?: string }).type === "exam" ? (data as { type: "quiz" | "exam" }).type : undefined,
           runId: data.runId,
           title: data.title,
           endTime: data.endTime ?? "",
@@ -672,6 +679,7 @@ export default function StudentExamsPage() {
           canvases: data.canvases ?? [],
           pdfScribbles: ext.pdfScribbles ?? null,
           sessionRevision: ext.sessionRevision,
+          savedAnswersBootstrap: ext.savedAnswers,
         });
         setExpired(true);
         setAnswers(fromServer);
@@ -684,6 +692,7 @@ export default function StudentExamsPage() {
         setStartedExam({
           attemptId: data.attemptId,
           examId: data.examId,
+          examType: (data as { type?: string }).type === "quiz" || (data as { type?: string }).type === "exam" ? (data as { type: "quiz" | "exam" }).type : undefined,
           runId: data.runId,
           title: data.title,
           endTime: data.endTime,
@@ -697,9 +706,15 @@ export default function StudentExamsPage() {
           pdfScribbles: ext.pdfScribbles ?? null,
           sessionRevision: ext.sessionRevision,
           resumeQuestionIndex: ext.resumeQuestionIndex,
+          savedAnswersBootstrap: ext.savedAnswers,
         });
         setExpired(false);
-        setAnswers(fromServer);
+        const isPdf = (data.sourceType || "").toUpperCase() === "PDF" || !!data.pdfUrl;
+        if (!isPdf) {
+          setAnswers(fromServer);
+        } else {
+          setAnswers({});
+        }
       }
       setSubmitted(false);
     },
@@ -844,13 +859,18 @@ export default function StudentExamsPage() {
         throw new Error("No exam");
       }
       const answerSnap = answersRef.current;
+      if (!opts?.cheatingDetected) {
+        isManualSubmitting.current = true;
+      }
       plannedExitRef.current = true;
 
-      if (ex.pdfUrl && examRunnerRef.current?.flushScribbles) {
-        await examRunnerRef.current.flushScribbles();
+      if (ex.pdfUrl && pdfExamTakerRef.current?.persistDraftAndScratchpad) {
+        await pdfExamTakerRef.current.persistDraftAndScratchpad();
+      } else if (ex.pdfUrl && pdfExamTakerRef.current?.flushScribbles) {
+        await pdfExamTakerRef.current.flushScribbles();
       }
-      if (examRunnerRef.current?.saveAllSituasiyaCanvases) {
-        await examRunnerRef.current.saveAllSituasiyaCanvases();
+      if (pdfExamTakerRef.current?.saveAllSituasiyaCanvases) {
+        await pdfExamTakerRef.current.saveAllSituasiyaCanvases();
       }
       // Non-PDF situation cards register their save hooks here. Run them before submit.
       const pendingSaves = Array.from(finalSituationSaveHooksRef.current.values()).map((fn) => fn());
@@ -858,30 +878,34 @@ export default function StudentExamsPage() {
         await Promise.allSettled(pendingSaves);
       }
 
-      const answersList = ex.questions.map((q) => {
-        const key = getAnswerKey(q);
-        const a = answerSnap[key];
-        const openSubType = subTypeFromRule(q.open_rule);
-        const normalizedTextAnswer = normalizeAnswer(a?.textAnswer ?? "", openSubType);
-        const qNumber = q.questionNumber ?? q.displayNumber;
-        if (q.questionId != null) {
-          return {
-            questionId: q.questionId,
-            questionNumber: qNumber,
-            selectedOptionId: a?.selectedOptionId ?? null,
-            selectedOptionKey: a?.selectedOptionKey ?? undefined,
-            textAnswer: normalizedTextAnswer,
-          };
-        }
-        return {
-          questionNumber: qNumber,
-          selectedOptionId: a?.selectedOptionId ?? null,
-          selectedOptionKey: a?.selectedOptionKey ?? undefined,
-          textAnswer: normalizedTextAnswer,
-        };
-      });
+      const isPdfRun = (ex.sourceType === "PDF" || !!ex.pdfUrl) && ex.runId != null;
+      const answersList = isPdfRun
+        ? pdfExamTakerRef.current?.getAnswersForSubmit() ?? []
+        : ex.questions.map((q) => {
+            const key = getAnswerKey(q);
+            const a = answerSnap[key];
+            const openSubType = subTypeFromRule(q.open_rule);
+            const normalizedTextAnswer = normalizeAnswer(a?.textAnswer ?? "", openSubType);
+            const qNumber = q.questionNumber ?? q.displayNumber;
+            if (q.questionId != null) {
+              return {
+                questionId: q.questionId,
+                questionNumber: qNumber,
+                selectedOptionId: a?.selectedOptionId ?? null,
+                selectedOptionKey: a?.selectedOptionKey ?? undefined,
+                textAnswer: normalizedTextAnswer,
+              };
+            }
+            return {
+              questionNumber: qNumber,
+              selectedOptionId: a?.selectedOptionId ?? null,
+              selectedOptionKey: a?.selectedOptionKey ?? undefined,
+              textAnswer: normalizedTextAnswer,
+            };
+          });
       const result = await studentApi.submitExam(ex.examId, ex.attemptId, answersList, {
         cheatingDetected: !!opts?.cheatingDetected,
+        ...(ex.examType ? { type: ex.examType } : {}),
       });
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
@@ -890,6 +914,7 @@ export default function StudentExamsPage() {
     },
     onSettled: () => {
       submitInFlightRef.current = false;
+      isManualSubmitting.current = false;
     },
     onSuccess: (data) => {
       setSubmitted(true);
@@ -901,11 +926,20 @@ export default function StudentExamsPage() {
       } catch {
         // ignore
       }
+      {
+        const ex = startedExamRef.current;
+        if (ex?.attemptId != null) clearPdfAttemptAnswersLocalStorage(ex.attemptId);
+        if (ex?.examId != null && ex?.attemptId != null) clearPdfScratchpadLocalStorage(ex.examId, ex.attemptId);
+      }
       queryClient.invalidateQueries({ queryKey: ["student", "exams"] });
       queryClient.invalidateQueries({ queryKey: ["student", "exam-results"] });
+      toast.success("İmtahan uğurla təhvil verildi");
     },
-    onError: () => {
+    onError: (err: unknown) => {
       plannedExitRef.current = false;
+      const e = err as { response?: { data?: { detail?: string } }; message?: string };
+      const msg = e?.response?.data?.detail || e?.message || "Təhvil alınmadı";
+      toast.error(String(msg));
     },
   });
 
@@ -1000,53 +1034,43 @@ export default function StudentExamsPage() {
     if (startedExam.pdfUrl && startedExam.runId != null) {
       return (
         <>
-          <ImageExamViewer
-            ref={examRunnerRef}
+          <PdfExamTaker
+            ref={pdfExamTakerRef}
+            rootRef={examContainerRef}
             runId={startedExam.runId}
             attemptId={startedExam.attemptId}
             examId={startedExam.examId}
             title={startedExam.title}
             questions={startedExam.questions}
-            answers={answers}
-            setAnswers={setAnswers}
+            bootstrapSavedAnswers={startedExam.savedAnswersBootstrap}
             canvases={startedExam.canvases}
             onSaveCanvas={handleSaveCanvas}
-            onSubmitClick={() => setShowSubmitModal(true)}
-            submitMutation={submitMutation}
-            countdownMs={countdownMs}
-            containerRef={examContainerRef}
             initialPdfScribbles={startedExam.pdfScribbles ?? null}
             formatCountdown={formatCountdown}
             resumeQuestionIndex={startedExam.resumeQuestionIndex}
+            countdownMs={countdownMs}
+            submitMutation={submitMutation}
+            onManualSubmitLockChange={(locked) => {
+              isManualSubmitting.current = locked;
+              if (locked) plannedExitRef.current = true;
+            }}
+            onSubmitConfirmed={() => {
+              isManualSubmitting.current = true;
+              plannedExitRef.current = true;
+              submitMutation.mutate({ cheatingDetected: false });
+            }}
           />
-          <Modal
-            isOpen={showSubmitModal}
-            onClose={() => setShowSubmitModal(false)}
-            title="Təsdiq"
+          <PortalDialog
+            open={cheatingModalOpen}
+            onClose={() => {}}
+            title="Xəbərdarlıq"
             size="sm"
+            closeOnBackdrop={false}
+            showCloseButton={false}
           >
-            <p className="text-slate-600 mb-4">İmtahanı təsdiq etmək istədiyinizə əminsiniz? Göndərildikdən sonra dəyişiklik etmək mümkün olmayacaq.</p>
-            <div className="flex gap-3 justify-end">
-              <button onClick={() => setShowSubmitModal(false)} className="btn-outline">
-                Ləğv et
-              </button>
-              <button
-                onClick={() => submitMutation.mutate({ cheatingDetected: false })}
-                disabled={submitMutation.isPending}
-                className="btn-primary flex items-center gap-2"
-              >
-                <Send className="w-4 h-4" />
-                {submitMutation.isPending ? "Göndərilir…" : "Təsdiq et"}
-              </button>
-            </div>
-          </Modal>
-          <Modal isOpen={cheatingModalOpen} onClose={() => {}} title="Xəbərdarlıq" size="sm">
             <p className="text-slate-700">Cheating detected! You left the exam environment.</p>
-            <p className="text-xs text-slate-500 mt-2">İmtahan avtomatik təhvil verilir...</p>
-          </Modal>
-          <Modal isOpen={suspendedModalOpen} onClose={() => {}} title="İmtahan dayandırıldı" size="sm">
-            <p className="text-slate-700">Sistemdən kənarlaşdığınız üçün imtahanınız dayandırıldı. Müəllimin icazəsini gözləyin.</p>
-          </Modal>
+            <p className="mt-2 text-xs text-slate-500">İmtahan avtomatik təhvil verilir...</p>
+          </PortalDialog>
         </>
       );
     }
@@ -1386,7 +1410,11 @@ export default function StudentExamsPage() {
                 Ləğv et
               </button>
               <button
-                onClick={() => submitMutation.mutate({ cheatingDetected: false })}
+                onClick={() => {
+                  isManualSubmitting.current = true;
+                  plannedExitRef.current = true;
+                  submitMutation.mutate({ cheatingDetected: false });
+                }}
                 disabled={submitMutation.isPending}
                 className="btn-primary flex items-center gap-2"
               >
@@ -1398,9 +1426,6 @@ export default function StudentExamsPage() {
           <Modal isOpen={cheatingModalOpen} onClose={() => {}} title="Xəbərdarlıq" size="sm">
             <p className="text-slate-700">Cheating detected! You left the exam environment.</p>
             <p className="text-xs text-slate-500 mt-2">İmtahan avtomatik təhvil verilir...</p>
-          </Modal>
-          <Modal isOpen={suspendedModalOpen} onClose={() => {}} title="İmtahan dayandırıldı" size="sm">
-            <p className="text-slate-700">Sistemdən kənarlaşdığınız üçün imtahanınız dayandırıldı. Müəllimin icazəsini gözləyin.</p>
           </Modal>
           <Modal isOpen={!!zoomImageUrl} onClose={() => setZoomImageUrl(null)} title="Şəkil" size="lg">
             {zoomImageUrl ? (

@@ -142,6 +142,7 @@ export const studentApi = {
       examId: number;
       runId: number;
       title: string;
+      type?: "quiz" | "exam";
       status: string;
       sourceType?: string;
       pdfUrl?: string | null;
@@ -182,6 +183,40 @@ export const studentApi = {
       status: string;
       finishedAt?: string | null;
     }>(`/student/exams/attempts/${attemptId}/sync`),
+  /** Active attempt snapshot (hydration / resume) without starting a new attempt */
+  getAttemptState: (attemptId: number) =>
+    api.get<{
+      attemptId: number;
+      examId?: number;
+      runId?: number | null;
+      status: string;
+      submitted: boolean;
+      serverNow?: string;
+      expiresAt?: string | null;
+      sessionRevision?: number;
+      savedAnswers?: Array<{
+        questionId?: number;
+        questionNumber?: number;
+        selectedOptionId?: number | string;
+        selectedOptionKey?: string;
+        textAnswer?: string;
+      }>;
+      scratchpadData?: { pageIndex: number; drawingData: Record<string, unknown> }[];
+      scratchpad_data?: { pageIndex: number; drawingData: Record<string, unknown> }[];
+    }>(`/student/exams/attempts/${attemptId}/state`),
+  saveDraftAnswers: (
+    attemptId: number,
+    answers: Array<
+      | {
+          questionId?: number;
+          questionNumber?: number;
+          selectedOptionId?: number | string | null;
+          selectedOptionKey?: string;
+          textAnswer?: string;
+        }
+      | { no: number; qtype: string; answer: string; questionId?: number }
+    >
+  ) => api.post<{ ok: boolean; attemptId: number }>(`/student/exams/attempts/${attemptId}/draft-answers`, { answers }),
   getMyExamResults: (params?: { type?: "quiz" | "exam"; published_only?: boolean }) => {
     const sp = new URLSearchParams();
     if (params?.type) sp.set("type", params.type);
@@ -223,16 +258,30 @@ export const studentApi = {
       }[];
       canvases?: { canvasId: number; questionId: number; imageUrl: string | null; updatedAt: string }[];
     }>(`/student/exams/${examId}/start`, {}),
-  submitExam: (examId: number, attemptId: number, answers: {
-    questionId?: number;
-    questionNumber?: number;
-    selectedOptionId?: number | string | null;
-    selectedOptionKey?: string;
-    textAnswer?: string;
-  }[], extra?: { cheatingDetected?: boolean }) =>
+  submitExam: (
+    examId: number,
+    attemptId: number,
+    answers: Array<
+      | {
+          questionId?: number;
+          questionNumber?: number;
+          selectedOptionId?: number | string | null;
+          selectedOptionKey?: string;
+          textAnswer?: string;
+        }
+      | { no: number; qtype: string; answer: string; questionId?: number }
+    >,
+    extra?: { cheatingDetected?: boolean; type?: "quiz" | "exam" }
+  ) =>
     api.post<{ attemptId: number; autoScore: number; maxScore: number; finishedAt: string }>(
       `/student/exams/${examId}/submit`,
-      { attemptId, answers, ...(extra?.cheatingDetected ? { cheatingDetected: true } : {}) }
+      {
+        attemptId,
+        exam_id: examId,
+        answers,
+        ...(extra?.type ? { type: extra.type } : {}),
+        ...(extra?.cheatingDetected ? { cheatingDetected: true } : {}),
+      }
     ),
   getExamResult: (
     examId: number,
@@ -297,12 +346,23 @@ export const studentApi = {
   savePdfScribbles: (
     attemptId: number,
     data:
-      | { pageIndex: number; drawingData: Record<string, unknown> }
-      | { scribbles: { pageIndex: number; drawingData: Record<string, unknown> }[] }
-  ) =>
-    api.post<{ saved?: { pageIndex: number; updatedAt: string }[]; pageIndex?: number; updatedAt?: string }>(
+      | { examId: number; pageIndex: number; drawingData: Record<string, unknown> }
+      | { examId: number; scribbles: { pageIndex: number; drawingData: Record<string, unknown> }[] }
+  ) => {
+    const payload = { ...data, exam_id: data.examId, examId: data.examId };
+    return api.post<{ saved?: { pageIndex: number; updatedAt: string }[]; pageIndex?: number; updatedAt?: string }>(
       `/student/exams/attempts/${attemptId}/pdf-scribbles`,
-      data
+      payload
+    );
+  },
+  /** Full scratchpad snapshot: attempt = student session; examId must match attempt (server-validated). */
+  upsertScratchpad: (
+    attemptId: number,
+    body: { examId: number; scribbles: { pageIndex: number; drawingData: Record<string, unknown> }[] }
+  ) =>
+    api.put<{ saved?: { pageIndex: number; updatedAt: string }[] }>(
+      `/student/exams/attempts/${attemptId}/upsert-scratchpad`,
+      { exam_id: body.examId, examId: body.examId, scribbles: body.scribbles }
     ),
   suspendExam: (
     payload: {

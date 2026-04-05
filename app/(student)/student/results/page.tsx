@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { studentApi } from "@/lib/student";
+import { formatMcSelectionForDisplay } from "@/lib/mc-option-display";
 import { Loading } from "@/components/Loading";
 import { Modal } from "@/components/Modal";
 import { Check, Circle, Eye, X } from "lucide-react";
@@ -178,7 +179,10 @@ export default function StudentResultsPage() {
                       </p>
                       <p className="text-slate-700 mt-1 whitespace-pre-wrap break-words">
                         <span className="text-slate-500">Sizin cavab: </span>
-                        {q.yourAnswer || "—"}
+                        {formatMcSelectionForDisplay(
+                          q.yourAnswer,
+                          (q as { options?: { id?: string | number; text?: string | null }[] }).options
+                        )}
                       </p>
                       <p className="text-slate-800 font-medium mt-2">
                         Bal: {q.scoreLabel ?? "—"}

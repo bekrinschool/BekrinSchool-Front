@@ -456,3 +456,10 @@ input[type="range"].situasiya-brush-range::-moz-range-thumb {
   padding-right: 0.25rem !important;
 }
 
+/* PDF exam taker: horizontal scroll when page is wider than viewport (tablet/mobile); do not clip. */
+.pdf-taker-scroll {
+  overflow-x: auto !important;
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch;
+}
+

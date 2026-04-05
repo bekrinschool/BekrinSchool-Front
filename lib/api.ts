@@ -1,6 +1,6 @@
 import { API_BASE_URL } from "./constants";
 
-type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export interface ApiError {
   status: number;
@@ -162,12 +162,22 @@ export const api = {
       body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
       headers: opts?.headers,
     }),
+  put: <T>(path: string, body?: unknown, opts?: { headers?: HeadersInit }) =>
+    request<T>(path, {
+      method: "PUT",
+      body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
+      headers: opts?.headers,
+    }),
   patch: <T>(path: string, body?: unknown, opts?: { headers?: HeadersInit }) =>
     request<T>(path, {
       method: "PATCH",
       body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
       headers: opts?.headers,
     }),
-  delete: <T>(path: string) => request<T>(path, { method: "DELETE" }),
+  delete: <T>(path: string, opts?: { body?: unknown }) =>
+    request<T>(path, {
+      method: "DELETE",
+      ...(opts?.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+    }),
 };
 

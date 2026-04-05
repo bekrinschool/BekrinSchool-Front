@@ -12,10 +12,11 @@ import {
 import { Loading } from "@/components/Loading";
 import { Modal } from "@/components/Modal";
 import { useToast } from "@/components/Toast";
-import { useForm } from "react-hook-form";
+import { useForm, Controller } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Plus, Edit2, Trash2, FileCode, ChevronDown, Eye, FileJson } from "lucide-react";
+import { CodeEditor } from "@/components/student-coding/CodeEditor";
 
 const importTestCaseSchema = z.object({
   input: z.string().min(1, "Input tələb olunur"),
@@ -211,6 +212,7 @@ export default function CodingPage() {
 
   const {
     register,
+    control,
     handleSubmit,
     formState: { errors },
     reset,
@@ -636,11 +638,20 @@ export default function CodingPage() {
           </div>
           <div>
             <label className="label">İlkin Kod (isteğe bağlı)</label>
-            <textarea
-              className="input font-mono text-sm"
-              rows={3}
-              {...register("starter_code")}
-              placeholder="# Python"
+            <Controller
+              name="starter_code"
+              control={control}
+              render={({ field }) => (
+                <CodeEditor
+                  value={field.value ?? ""}
+                  onChange={field.onChange}
+                  placeholder="# Python"
+                  minHeight="160px"
+                  tabSize={2}
+                  templateCode={editingTask?.starter_code ?? "# Python\n"}
+                  showToolbar
+                />
+              )}
             />
           </div>
           <div className="grid grid-cols-2 gap-4">

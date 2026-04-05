@@ -7,10 +7,16 @@ import { Loading } from "@/components/Loading";
 import { Modal } from "@/components/Modal";
 import { useDebounce } from "@/lib/useDebounce";
 import Link from "next/link";
-import { Plus, Trash2, ChevronRight, Edit2, Search, Upload, FileText, Eye, Archive } from "lucide-react";
+import { Plus, Trash2, ChevronRight, Edit2, Search, Upload, FileText, FileJson, Eye, Archive } from "lucide-react";
 import { API_BASE_URL } from "@/lib/constants";
 import { UniversalLatex } from "@/components/common/MathContent";
 import { normalizeAnswer, subTypeFromRule, type OpenAnswerSubType } from "@/lib/answer-normalizer";
+import { CodeEditor } from "@/components/student-coding/CodeEditor";
+import {
+  parseQuestionBankImportJson,
+  QUESTION_BANK_JSON_IMPORT_TEMPLATE,
+} from "@/lib/question-bank-json-import";
+import { useToast } from "@/components/Toast";
 
 const DELETE_CONFIRM_MESSAGE = "Bu sualı/mövzunu tamamilə silmək istədiyinizə əminsiniz? Geri qaytarmaq olmayacaq.";
 const DELETE_BULK_CONFIRM_MESSAGE = "Seçilmiş sualları/mövzuları tamamilə silmək istədiyinizə əminsiniz? Geri qaytarmaq olmayacaq.";
@@ -90,6 +96,9 @@ export default function QuestionBankPage() {
   const [questionSearch, setQuestionSearch] = useState("");
   const [questionTypeFilter, setQuestionTypeFilter] = useState("");
   const [showUploadPDF, setShowUploadPDF] = useState(false);
+  const [showJsonImportModal, setShowJsonImportModal] = useState(false);
+  const [jsonImportText, setJsonImportText] = useState(QUESTION_BANK_JSON_IMPORT_TEMPLATE);
+  const [jsonImportError, setJsonImportError] = useState<string | null>(null);
   const [pdfSearch, setPdfSearch] = useState("");
   const [pdfYearFilter, setPdfYearFilter] = useState("");
   
@@ -130,6 +139,45 @@ export default function QuestionBankPage() {
     return () => URL.revokeObjectURL(u);
   }, [newQ.questionImage]);
   const queryClient = useQueryClient();
+  const toast = useToast();
+
+  const importJsonQuestionsMutation = useMutation({
+    mutationFn: async () => {
+      const topicId = selectedTopicId;
+      if (topicId == null) throw new Error("Mövzu seçilməyib");
+      const parsed = parseQuestionBankImportJson(topicId, jsonImportText);
+      if (!parsed.ok) throw new Error(parsed.errors.join(" "));
+      let i = 0;
+      for (const payload of parsed.items) {
+        i += 1;
+        try {
+          await teacherApi.createQuestion(payload);
+        } catch (e: unknown) {
+          const err = e as { response?: { data?: { detail?: unknown } }; data?: { detail?: unknown }; message?: string };
+          const d = err?.response?.data?.detail ?? err?.data?.detail;
+          const msg =
+            typeof d === "string"
+              ? d
+              : d && typeof d === "object"
+                ? JSON.stringify(d)
+                : err?.message || "Saxlama alınmadı";
+          throw new Error(`Sual ${i}: ${msg}`);
+        }
+      }
+      return parsed.items.length;
+    },
+    onSuccess: (count) => {
+      queryClient.invalidateQueries({ queryKey: ["teacher", "questions"] });
+      queryClient.invalidateQueries({ queryKey: ["teacher", "questions", "all"] });
+      setShowJsonImportModal(false);
+      setJsonImportError(null);
+      toast.success(`${count} sual idxal olundu`);
+    },
+    onError: (e: Error) => {
+      setJsonImportError(e.message);
+      toast.error(e.message);
+    },
+  });
 
   const { data: topics = [], isLoading: topicsLoading } = useQuery({
     queryKey: ["teacher", "question-topics"],
@@ -573,6 +621,18 @@ export default function QuestionBankPage() {
                   >
                     <Plus className="w-4 h-4" />
                     Yeni sual
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setJsonImportText(QUESTION_BANK_JSON_IMPORT_TEMPLATE);
+                      setJsonImportError(null);
+                      setShowJsonImportModal(true);
+                    }}
+                    className="btn-outline text-sm inline-flex items-center gap-1.5"
+                  >
+                    <FileJson className="w-4 h-4" />
+                    JSON ilə idxal et
                   </button>
                 </div>
               </div>
@@ -1388,6 +1448,64 @@ export default function QuestionBankPage() {
           </div>
         )}
       </div>
+
+      <Modal
+        isOpen={showJsonImportModal}
+        onClose={() => {
+          setShowJsonImportModal(false);
+          setJsonImportError(null);
+        }}
+        title="JSON ilə idxal"
+        size="lg"
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-slate-600">
+            Cari mövzu:{" "}
+            <span className="font-medium text-slate-900">
+              {selectedTopicId != null ? topics.find((t) => t.id === selectedTopicId)?.name ?? `#${selectedTopicId}` : "—"}
+            </span>
+            . JSON yalnız sual massivi (<code className="text-xs bg-slate-100 px-1 rounded">[...]</code>) olmalıdır; idxal olunmuş
+            suallar əl ilə yaradılmış suallarla eyni formatda saxlanılır.
+          </p>
+          <div>
+            <label className="label">Sual massivi (JSON)</label>
+            <CodeEditor
+              value={jsonImportText}
+              onChange={(v) => {
+                setJsonImportText(v);
+                setJsonImportError(null);
+              }}
+              minHeight="280px"
+              tabSize={2}
+              templateCode={QUESTION_BANK_JSON_IMPORT_TEMPLATE}
+              showToolbar
+              showCopyButton={false}
+              placeholder={`[ { "qtype": "closed", ... } ]`}
+            />
+            {jsonImportError && <p className="mt-2 text-xs text-red-600">{jsonImportError}</p>}
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button
+              type="button"
+              className="btn-primary flex-1"
+              disabled={importJsonQuestionsMutation.isPending || selectedTopicId == null}
+              onClick={() => importJsonQuestionsMutation.mutate()}
+            >
+              {importJsonQuestionsMutation.isPending ? "Idxal olunur…" : "İdxal et"}
+            </button>
+            <button
+              type="button"
+              className="btn-outline flex-1"
+              onClick={() => {
+                setShowJsonImportModal(false);
+                setJsonImportError(null);
+              }}
+            >
+              Bağla
+            </button>
+          </div>
+        </div>
+      </Modal>
 
       {/* Upload PDF Modal */}
       <Modal isOpen={showUploadPDF} onClose={() => { setShowUploadPDF(false); setUploadFile(null); setNewPDF({ title: "", year: "", tags: "", source: "" }); }} title="PDF yüklə">

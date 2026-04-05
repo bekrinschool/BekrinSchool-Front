@@ -569,6 +569,15 @@ export const teacherApi = {
   hardDeletePdf: (id: number) => api.delete(`/teacher/pdfs/${id}/hard-delete`),
   bulkDeleteExams: (ids: number[]) => api.post<{ deleted: number; message: string }>(`/teacher/archive/exams/bulk-delete`, { ids }),
   bulkDeletePdfs: (ids: number[]) => api.post<{ deleted: number; message: string }>(`/teacher/archive/pdfs/bulk-delete`, { ids }),
+  /** Unified archive bulk delete (archived items only). Body: { category, ids: number[] } */
+  archiveBulkDelete: (
+    category: string,
+    ids: number[]
+  ) =>
+    api.delete<{ deleted: number; message?: string; errors?: { type?: string; id?: number; detail?: string }[] }>(
+      `/teacher/archive/bulk`,
+      { body: { category, ids } }
+    ),
   getExamDetail: (id: number) => api.get<ExamDetail>(`/teacher/exams/${id}`),
   activateExam: (examId: number, data: { start_time: string; duration_minutes: number }) =>
     api.post<ExamListItem>(`/teacher/exams/${examId}/activate`, data),
