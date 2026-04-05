@@ -82,7 +82,7 @@ export interface SituasiyaCanvasProps {
   initialJson?: object | null;
   /** Fallback: load this image when no initialJson (e.g. legacy canvas saved as PNG) */
   initialImageUrl?: string | null;
-  onSaveStatus?: (status: "saved" | "unsaved" | "saving") => void;
+  onSaveStatus?: (status: "saved" | "unsaved" | "saving" | "error") => void;
   answerId?: number;
   situationIndex?: number;
 }
@@ -94,6 +94,10 @@ export interface SituasiyaCanvasRef {
     width: number;
     height: number;
   };
+  /** Parent called save API successfully — update top status only (no extra labels). */
+  markServerSaving: () => void;
+  markServerSaved: () => void;
+  markServerSaveFailed: () => void;
 }
 
 const SituasiyaCanvas = forwardRef<SituasiyaCanvasRef, SituasiyaCanvasProps>(
@@ -114,9 +118,7 @@ const SituasiyaCanvas = forwardRef<SituasiyaCanvasRef, SituasiyaCanvasProps>(
     const [canvasH, setCanvasH] = useState(
       () => extractSavedCanvasDimensions(initialJson).height
     );
-    const [saveStatus, setSaveStatus] = useState<"saved" | "unsaved" | "saving">(
-      "saved"
-    );
+    const [saveStatus, setSaveStatus] = useState<"saved" | "unsaved" | "saving" | "error">("saved");
     const [fabricError, setFabricError] = useState(false);
 
     /** Screen-space eraser ring center, relative to drawing container (matches Fabric eraser brush width = brushSize * 4). */
@@ -237,6 +239,8 @@ const SituasiyaCanvas = forwardRef<SituasiyaCanvasRef, SituasiyaCanvasProps>(
                 canvas.setDimensions({ width: w, height: targetH });
                 setCanvasH(targetH);
                 canvas.renderAll();
+                setSaveStatus("saved");
+                onSaveStatus?.("saved");
               } catch {
                 if (isMounted) setFabricError(true);
               }
@@ -252,6 +256,8 @@ const SituasiyaCanvas = forwardRef<SituasiyaCanvasRef, SituasiyaCanvasProps>(
               img.scaleToWidth(w);
               c.add(img);
               c.renderAll();
+              setSaveStatus("saved");
+              onSaveStatus?.("saved");
             })
             .catch(() => {});
         }
@@ -364,8 +370,20 @@ const SituasiyaCanvas = forwardRef<SituasiyaCanvasRef, SituasiyaCanvasProps>(
             };
           }
         },
+        markServerSaving: () => {
+          setSaveStatus("saving");
+          onSaveStatus?.("saving");
+        },
+        markServerSaved: () => {
+          setSaveStatus("saved");
+          onSaveStatus?.("saved");
+        },
+        markServerSaveFailed: () => {
+          setSaveStatus("error");
+          onSaveStatus?.("error");
+        },
       }),
-      [canvasH]
+      [canvasH, onSaveStatus]
     );
 
     const expandHeight = useCallback(() => {
@@ -423,12 +441,22 @@ const SituasiyaCanvas = forwardRef<SituasiyaCanvasRef, SituasiyaCanvasProps>(
     const rangePct = `${((brushSize - 1) / 11) * 100}%`;
 
     const saveStatusEl = (
-      <span className="ml-auto text-xs font-medium text-slate-500">
+      <span
+        className={`ml-auto text-xs font-medium ${
+          saveStatus === "saved"
+            ? "text-emerald-600"
+            : saveStatus === "error"
+              ? "text-rose-600"
+              : "text-slate-500"
+        }`}
+      >
         {saveStatus === "saved"
           ? "Yadda saxlanıldı"
           : saveStatus === "saving"
-            ? "Saxlanır..."
-            : "Saxlanmayıb"}
+            ? "Saxlanılır..."
+            : saveStatus === "error"
+              ? "Saxlama xətası"
+              : "Saxlanılmayıb"}
       </span>
     );
 

@@ -178,6 +178,42 @@ export type ScribbleDrawingData = {
   strokes?: { tool: "pen" | "eraser"; width: number; points: { x: number; y: number }[] }[];
 };
 
+/** True if scratchpad page has drawable ink (avoids ghost saves / empty upserts wiping DB). */
+export function pdfScribbleDrawingHasInk(data: ScribbleDrawingData | undefined | null): boolean {
+  const strokes = data?.strokes;
+  if (!Array.isArray(strokes) || strokes.length === 0) return false;
+  return strokes.some((s) => (s?.points?.length ?? 0) >= 2);
+}
+
+function normalizeDrawingDataFromApi(dd: unknown): ScribbleDrawingData {
+  if (dd == null) return { strokes: [] };
+  if (typeof dd === "string") {
+    try {
+      const p = JSON.parse(dd) as unknown;
+      if (p && typeof p === "object") return p as ScribbleDrawingData;
+    } catch {
+      /* ignore */
+    }
+    return { strokes: [] };
+  }
+  if (typeof dd === "object") return dd as ScribbleDrawingData;
+  return { strokes: [] };
+}
+
+function coerceFabricCanvasJson(raw: unknown): object | null {
+  if (raw == null) return null;
+  if (typeof raw === "object") return raw as object;
+  if (typeof raw === "string") {
+    try {
+      const p = JSON.parse(raw) as unknown;
+      return p != null && typeof p === "object" ? (p as object) : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /** draft_{examId}_{attemptId} — attempt is unique per student session (user id not required on client). */
 export function pdfScratchpadStorageKey(examId: number, attemptId: number) {
   return `draft_${examId}_${attemptId}`;
@@ -230,7 +266,7 @@ function applyScratchpadPayloadToRef(
     if (pi == null) continue;
     const pageIndex = Number(pi);
     if (!Number.isFinite(pageIndex) || pageIndex < 0) continue;
-    ref.current.set(pageIndex, dd && typeof dd === "object" ? (dd as ScribbleDrawingData) : { strokes: [] });
+    ref.current.set(pageIndex, normalizeDrawingDataFromApi(dd));
     any = true;
   }
   return any;
@@ -281,12 +317,77 @@ function studentAnswersFromSavedRows(
   return out;
 }
 
+type PdfAttemptCanvasRow = {
+  questionId?: number;
+  situationIndex?: number;
+  imageUrl?: string | null;
+  canvasJson?: object;
+  canvasSnapshot?: string | null;
+};
+
+/**
+ * Hazır İmtahan-style: which situasiya `no` already has DB mətn and/or canvas (Davam et).
+ * PDF exam uses attempt APIs + props (no shared useExamStore scratchpad).
+ */
+function computePdfSituationResumeSyncedByNo(
+  qs: PdfExamTakerQuestion[],
+  savedAnswerRows: SavedAnswerRow[] | undefined,
+  canvases: PdfAttemptCanvasRow[] | undefined,
+  textOverlay?: Record<number, string>
+): Record<number, boolean> {
+  const fromServer = studentAnswersFromSavedRows(qs, savedAnswerRows);
+  const idxMap = new Map<string, number>();
+  let ord = 0;
+  for (const qq of qs) {
+    if (resolvePdfQtype(qq) !== "situation") continue;
+    ord += 1;
+    idxMap.set(getAnswerKey(qq), ord);
+  }
+  const out: Record<number, boolean> = {};
+  for (const q of qs) {
+    if (resolvePdfQtype(q) !== "situation") continue;
+    const num = questionNo(q);
+    if (!num) continue;
+    const hasText = String(fromServer[num] ?? textOverlay?.[num] ?? "").trim().length > 0;
+    const sitIdx = idxMap.get(getAnswerKey(q)) ?? 0;
+    let hasCanvas = false;
+    if (sitIdx >= 1 && canvases?.length) {
+      const row = canvases.find(
+        (c) => (q.questionId != null && c.questionId === q.questionId) || c.situationIndex === sitIdx
+      );
+      const r = row as PdfAttemptCanvasRow | undefined;
+      hasCanvas = !!(
+        r &&
+        (r.canvasJson != null ||
+          (typeof r.imageUrl === "string" && r.imageUrl.length > 0) ||
+          (typeof r.canvasSnapshot === "string" && r.canvasSnapshot.length > 0))
+      );
+    }
+    if (hasText || hasCanvas) out[num] = true;
+  }
+  return out;
+}
+
+function mergePdfSituationResumeFlags(
+  prev: Record<number, boolean>,
+  incoming: Record<number, boolean>
+): Record<number, boolean> {
+  const next = { ...prev };
+  for (const [nk, v] of Object.entries(incoming)) {
+    const n = Number(nk);
+    if (v && next[n] !== false) next[n] = true;
+  }
+  return next;
+}
+
 export interface PdfExamTakerRef {
   getAnswersForSubmit: () => PdfCompactAnswerRow[];
   flushScribbles: () => Promise<void>;
   saveAllSituasiyaCanvases: () => Promise<void>;
   /** Flush scratchpad + bubble-sheet draft to the server (anti-cheat / pre-submit). */
   persistDraftAndScratchpad: () => Promise<void>;
+  /** True while PDF scratchpad or situasiya draft save is in flight (submit should wait). */
+  isDraftSaveInProgress: () => boolean;
 }
 
 export interface PdfExamTakerProps {
@@ -375,6 +476,14 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
   const isDrawerMode = windowWidth < 1280;
   const isMobile = windowWidth < 768;
   const [scratchpadSavePending, setScratchpadSavePending] = useState(false);
+  /** PDF page scratchpad rows were loaded from DB — show green “Yadda saxlanıldı” in header. */
+  const [pdfScratchpadDbRestored, setPdfScratchpadDbRestored] = useState(false);
+  /** SituationSmartCard: `studentSaveStatus` per sual `no` */
+  const [pdfSituationSaveStatus, setPdfSituationSaveStatus] = useState<
+    Record<number, "idle" | "saving" | "saved" | "error">
+  >({});
+  /** Davam et: server had mətn/canvas for this `no` → show “Yadda saxlanıldı” until user edits */
+  const [pdfSituationResumeSynced, setPdfSituationResumeSynced] = useState<Record<number, boolean>>({});
   const [scribbleRedrawTick, setScribbleRedrawTick] = useState(0);
   const [submitConfirmOpen, setSubmitConfirmOpen] = useState(false);
   const submitConfirmHasEmptyRef = useRef(false);
@@ -386,9 +495,12 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
   const pinchStartRef = useRef<{ dist: number; scale: number } | null>(null);
   const overlayCanvasesRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const scribblesRef = useRef<Map<number, ScribbleDrawingData>>(new Map());
+  /** After explicit “clear page”, allow one persist of empty strokes so DB matches. */
+  const forcePersistEmptyScratchPagesRef = useRef<Set<number>>(new Set());
   const scribbleDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scratchpadLsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scratchpadSaveLockRef = useRef(false);
+  const situationDraftSaveLockRef = useRef(false);
   const answersPersistDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentStrokeRef = useRef<{ tool: "pen" | "eraser"; width: number; points: { x: number; y: number }[] } | null>(
     null
@@ -399,8 +511,10 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
   const answerDrawerScrollRef = useRef<HTMLDivElement>(null);
   const studentAnswersRef = useRef(studentAnswers);
   const questionsRef = useRef(questions);
+  const canvasesRef = useRef(canvases);
   studentAnswersRef.current = studentAnswers;
   questionsRef.current = questions;
+  canvasesRef.current = canvases ?? [];
 
   /** 1-based index for API canvas rows (must match server situationIndex). Document order. */
   const situationIndexByAnswerKey = useMemo(() => {
@@ -417,6 +531,21 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
   const situationIndexForQuestion = (q: PdfExamTakerQuestion): number => {
     return situationIndexByAnswerKey.get(getAnswerKey(q)) ?? 0;
   };
+
+  const situationQuestionNos = useMemo(() => {
+    const s = new Set<number>();
+    for (const q of questions) {
+      if (resolvePdfQtype(q) !== "situation") continue;
+      const n = questionNo(q);
+      if (n) s.add(n);
+    }
+    return s;
+  }, [questions]);
+
+  const anySituationSaving = useMemo(
+    () => Object.values(pdfSituationSaveStatus).some((x) => x === "saving"),
+    [pdfSituationSaveStatus]
+  );
 
   useEffect(() => {
     if (answersPersistDebounceRef.current) clearTimeout(answersPersistDebounceRef.current);
@@ -439,7 +568,11 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     if (scribbleDebounceRef.current) clearTimeout(scribbleDebounceRef.current);
     scribbleDebounceRef.current = setTimeout(() => {
       scribbleDebounceRef.current = null;
-      const pending = Array.from(scribblesRef.current.entries());
+      const pending = Array.from(scribblesRef.current.entries()).filter(
+        ([pageIndex, drawingData]) =>
+          pdfScribbleDrawingHasInk(drawingData || {}) || forcePersistEmptyScratchPagesRef.current.has(pageIndex)
+      );
+      if (pending.length === 0) return;
       void Promise.all(
         pending.map(([pageIndex, drawingData]) =>
           studentApi.savePdfScribbles(attemptId, {
@@ -448,7 +581,11 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
             drawingData: drawingData || {},
           })
         )
-      ).catch(() => {});
+      )
+        .then(() => {
+          for (const [pi] of pending) forcePersistEmptyScratchPagesRef.current.delete(pi);
+        })
+        .catch(() => {});
     }, 1000);
   }, [attemptId, examId]);
 
@@ -495,16 +632,45 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
         ]);
         if (cancelled || st.submitted) return;
         const fromServer = studentAnswersFromSavedRows(questionsRef.current, st.savedAnswers);
-        setStudentAnswers((prev) => ({ ...fromServer, ...prev }));
+        const mergedAnswers = (() => {
+          const prev = studentAnswersRef.current;
+          const next = { ...fromServer, ...prev };
+          for (const q of questionsRef.current) {
+            if (resolvePdfQtype(q) !== "situation") continue;
+            const no = questionNo(q);
+            if (fromServer[no] !== undefined) next[no] = String(fromServer[no]);
+          }
+          return next;
+        })();
+        studentAnswersRef.current = mergedAnswers;
+        setStudentAnswers(mergedAnswers);
 
         const stExt = st as {
           scratchpadData?: unknown;
           scratchpad_data?: unknown;
         };
         const sp = stExt.scratchpadData ?? stExt.scratchpad_data;
-        let applied = applyScratchpadPayloadToRef(sp, scribblesRef);
+        let applied = false;
+        let appliedFromDb = false;
+        if (applyScratchpadPayloadToRef(sp, scribblesRef)) {
+          applied = true;
+          appliedFromDb = true;
+        }
+
+        const resumeFlags = computePdfSituationResumeSyncedByNo(
+          questionsRef.current,
+          st.savedAnswers as SavedAnswerRow[] | undefined,
+          (canvasesRef.current ?? []) as PdfAttemptCanvasRow[],
+          mergedAnswers
+        );
+        if (Object.keys(resumeFlags).length > 0) {
+          setPdfSituationResumeSynced((prev) => mergePdfSituationResumeFlags(prev, resumeFlags));
+        }
         if (!applied && scribbleGet?.scribbles?.length) {
-          applied = applyScratchpadPayloadToRef(scribbleGet.scribbles, scribblesRef);
+          if (applyScratchpadPayloadToRef(scribbleGet.scribbles, scribblesRef)) {
+            applied = true;
+            appliedFromDb = true;
+          }
         }
         if (!applied) {
           const ls = readScratchpadLs(examId, attemptId);
@@ -512,7 +678,13 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
             applied = applyScratchpadPayloadToRef(ls.scribbles, scribblesRef);
           }
         }
-        if (applied) setScribbleRedrawTick((t) => t + 1);
+        if (applied) {
+          if (appliedFromDb) {
+            setPdfScratchpadDbRestored(true);
+            console.log("PDF scratchpad restored from DB", { examId, attemptId, attempt_id: attemptId });
+          }
+          setScribbleRedrawTick((t) => t + 1);
+        }
       } catch {
         if (cancelled) return;
         const ls = readScratchpadLs(examId, attemptId);
@@ -533,6 +705,17 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     setStudentAnswers(next);
     studentAnswersRef.current = next;
   }, [attemptId, examId, bootstrapSavedAnswers]);
+
+  useEffect(() => {
+    const flags = computePdfSituationResumeSyncedByNo(
+      questions,
+      bootstrapSavedAnswers as SavedAnswerRow[] | undefined,
+      (canvases ?? []) as PdfAttemptCanvasRow[],
+      studentAnswersRef.current
+    );
+    if (Object.keys(flags).length === 0) return;
+    setPdfSituationResumeSynced((prev) => mergePdfSituationResumeFlags(prev, flags));
+  }, [questions, bootstrapSavedAnswers, canvases]);
 
   useEffect(() => {
     return () => {
@@ -637,6 +820,9 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     initialPdfScribbles.forEach(({ pageIndex, drawingData }) => {
       scribblesRef.current.set(pageIndex, drawingData || { strokes: [] });
     });
+    if (initialPdfScribbles.some(({ drawingData }) => pdfScribbleDrawingHasInk(drawingData))) {
+      setPdfScratchpadDbRestored(true);
+    }
     setScribbleRedrawTick((t) => t + 1);
   }, [initialPdfScribbles]);
 
@@ -745,6 +931,7 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
         if (ctx) ctx.clearRect(0, 0, overlay.width, overlay.height);
       }
       scribblesRef.current.set(pageIndex, { strokes: [] });
+      forcePersistEmptyScratchPagesRef.current.add(pageIndex);
       scheduleScribblePersist();
       scheduleScratchpadLsBackup();
     },
@@ -771,6 +958,10 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
   }, [attemptId, examId]);
 
   const persistPdfDraftNow = useCallback(async () => {
+    if (answersPersistDebounceRef.current) {
+      clearTimeout(answersPersistDebounceRef.current);
+      answersPersistDebounceRef.current = null;
+    }
     const raw = studentAnswersRef.current;
     const map: Record<number, string> = {};
     for (const [k, v] of Object.entries(raw)) {
@@ -782,31 +973,6 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     await studentApi.saveDraftAnswers(attemptId, list);
   }, [attemptId, examId]);
 
-  const handleScratchpadManualSave = useCallback(async () => {
-    if (scratchpadSaveLockRef.current) return;
-    scratchpadSaveLockRef.current = true;
-    setScratchpadSavePending(true);
-    try {
-      if (scribbleDebounceRef.current) {
-        clearTimeout(scribbleDebounceRef.current);
-        scribbleDebounceRef.current = null;
-      }
-      const scribbles = Array.from(scribblesRef.current.entries()).map(([pageIndex, drawingData]) => ({
-        pageIndex,
-        drawingData: drawingData || { strokes: [] },
-      }));
-      await studentApi.upsertScratchpad(attemptId, { examId, scribbles });
-      writeScratchpadLs(examId, attemptId, scribbles);
-      await persistPdfDraftNow();
-      toast.success("Uğurla yadda saxlanıldı");
-    } catch {
-      toast.error("Qaralama saxlanılmadı");
-    } finally {
-      scratchpadSaveLockRef.current = false;
-      setScratchpadSavePending(false);
-    }
-  }, [attemptId, examId, persistPdfDraftNow, toast]);
-
   const saveSituationCanvasAtIndex = useCallback(
     async (sitIdx: number, questionId?: number) => {
       if (!onSaveCanvas || sitIdx < 1) return;
@@ -814,7 +980,9 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
       if (!canvasRef?.getCanvasData) return;
       const data = canvasRef.getCanvasData();
       if (!data.snapshotBase64 && !(data.json && Object.keys(data.json || {}).length > 0)) return;
-      await onSaveCanvas(questionId, sitIdx)({
+      // Mirror Hazır İmtahan: send situationIndex only when questionId is absent (exams/page handleSaveCanvas).
+      const situationIndexForApi = questionId == null ? sitIdx : undefined;
+      await onSaveCanvas(questionId, situationIndexForApi)({
         json: data.json,
         snapshotBase64: data.snapshotBase64,
         width: data.width,
@@ -824,26 +992,55 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     [onSaveCanvas]
   );
 
-  /** Situasiya: textarea mətnini string kimi saxla (draft API + LS) + optional rəsm. */
-  const saveSituationDraftClick = useCallback(
-    async (sitIdx: number, questionId: number | undefined, situationNo: number) => {
+  /**
+   * SituationSmartCard.saveStudentCanvas + PDF `saveDraftAnswers` (mətn by `no`).
+   * Same sequence: saving → await onCanvasSave(data) when canvas non-empty → saved → toast → idle @ 1800ms.
+   */
+  const pdfSituationSaveDraft = useCallback(
+    async (sitIdx: number, questionId: number | undefined, questionNo: number) => {
+      situationDraftSaveLockRef.current = true;
+      setPdfSituationSaveStatus((prev) => ({ ...prev, [questionNo]: "saving" }));
+      const fabricRef = sitIdx >= 1 ? situationCanvasRefsMap.current.get(sitIdx) : undefined;
+      fabricRef?.markServerSaving?.();
       try {
-        const situationText = String(studentAnswersRef.current[situationNo] ?? "");
-        setStudentAnswers((prev) => {
-          const next = { ...prev, [situationNo]: situationText };
-          studentAnswersRef.current = next;
-          return next;
-        });
         await persistPdfDraftNow();
         if (sitIdx >= 1 && onSaveCanvas) {
-          await saveSituationCanvasAtIndex(sitIdx, questionId);
+          const canvasRef = situationCanvasRefsMap.current.get(sitIdx);
+          if (canvasRef?.getCanvasData) {
+            const data = canvasRef.getCanvasData();
+            if (data.snapshotBase64 || Object.keys(data.json || {}).length > 0) {
+              const situationIndexForApi = questionId == null ? sitIdx : undefined;
+              await onSaveCanvas(questionId, situationIndexForApi)({
+                json: data.json,
+                snapshotBase64: data.snapshotBase64,
+                width: data.width,
+                height: data.height,
+              });
+            }
+          }
         }
-        toast.success("Yadda saxlanıldı");
-      } catch {
-        toast.error("Saxlama alınmadı");
+        fabricRef?.markServerSaved?.();
+        setPdfSituationSaveStatus((prev) => ({ ...prev, [questionNo]: "saved" }));
+        setPdfSituationResumeSynced((prev) => ({ ...prev, [questionNo]: true }));
+        toast.success("Uğurla saxlanıldı");
+        window.setTimeout(() => {
+          setPdfSituationSaveStatus((prev) => {
+            if (prev[questionNo] !== "saved") return prev;
+            return { ...prev, [questionNo]: "idle" };
+          });
+        }, 1800);
+      } catch (e: unknown) {
+        console.error("Situation save failed", e);
+        fabricRef?.markServerSaveFailed?.();
+        setPdfSituationSaveStatus((prev) => ({ ...prev, [questionNo]: "error" }));
+        const msg =
+          e && typeof e === "object" && "message" in e ? String((e as { message?: string }).message) : "";
+        toast.error(msg || "Saxlama alınmadı");
+      } finally {
+        situationDraftSaveLockRef.current = false;
       }
     },
-    [onSaveCanvas, persistPdfDraftNow, saveSituationCanvasAtIndex, toast]
+    [onSaveCanvas, persistPdfDraftNow, toast]
   );
 
   /** Best-effort: persist every inline situation canvas before submit. */
@@ -865,6 +1062,48 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     }
   }, [onSaveCanvas, saveSituationCanvasAtIndex]);
 
+  const handleScratchpadManualSave = useCallback(async () => {
+    if (scratchpadSaveLockRef.current) return;
+    scratchpadSaveLockRef.current = true;
+    setScratchpadSavePending(true);
+    try {
+      if (answersPersistDebounceRef.current) {
+        clearTimeout(answersPersistDebounceRef.current);
+        answersPersistDebounceRef.current = null;
+      }
+      if (scribbleDebounceRef.current) {
+        clearTimeout(scribbleDebounceRef.current);
+        scribbleDebounceRef.current = null;
+      }
+      const scribbles = Array.from(scribblesRef.current.entries()).map(([pageIndex, drawingData]) => ({
+        pageIndex,
+        drawingData: drawingData || { strokes: [] },
+      }));
+      const toUpsert = scribbles.filter(
+        ({ pageIndex, drawingData }) =>
+          pdfScribbleDrawingHasInk(drawingData) || forcePersistEmptyScratchPagesRef.current.has(pageIndex)
+      );
+      console.log("Saving Draft for ID:", examId, {
+        attemptId,
+        scratchpadPages: toUpsert.map((s) => s.pageIndex),
+        scribbleCount: toUpsert.length,
+      });
+      if (toUpsert.length > 0) {
+        await studentApi.upsertScratchpad(attemptId, { examId, scribbles: toUpsert });
+        for (const s of toUpsert) forcePersistEmptyScratchPagesRef.current.delete(s.pageIndex);
+      }
+      writeScratchpadLs(examId, attemptId, scribbles);
+      await persistPdfDraftNow();
+      await saveAllSituasiyaCanvases();
+      toast.success("Uğurla yadda saxlanıldı");
+    } catch {
+      toast.error("Qaralama saxlanılmadı");
+    } finally {
+      scratchpadSaveLockRef.current = false;
+      setScratchpadSavePending(false);
+    }
+  }, [attemptId, examId, persistPdfDraftNow, saveAllSituasiyaCanvases, toast]);
+
   const persistDraftAndScratchpad = useCallback(async () => {
     await flushScribbles();
     await persistPdfDraftNow();
@@ -877,8 +1116,13 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
       flushScribbles,
       saveAllSituasiyaCanvases,
       persistDraftAndScratchpad,
+      isDraftSaveInProgress: () =>
+        scratchpadSaveLockRef.current ||
+        situationDraftSaveLockRef.current ||
+        scratchpadSavePending ||
+        Object.values(pdfSituationSaveStatus).some((x) => x === "saving"),
     }),
-    [flushScribbles, saveAllSituasiyaCanvases, persistDraftAndScratchpad]
+    [flushScribbles, saveAllSituasiyaCanvases, persistDraftAndScratchpad, scratchpadSavePending, pdfSituationSaveStatus]
   );
 
   const preventFocusScroll = useCallback((e: React.MouseEvent) => {
@@ -915,27 +1159,41 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
   const setAnswer = useCallback((no: number, value: string) => {
     if (!no) return;
     const s = String(value);
+    if (situationQuestionNos.has(no)) {
+      setPdfSituationResumeSynced((prev) => ({ ...prev, [no]: false }));
+      setPdfSituationSaveStatus((prev) => (prev[no] === "error" ? { ...prev, [no]: "idle" } : prev));
+    }
     setStudentAnswers((prev) => {
       const next = { ...prev, [no]: s };
       studentAnswersRef.current = next;
       return next;
     });
-  }, []);
+  }, [situationQuestionNos]);
+
+  const blockSubmitWhileDraftSaving = scratchpadSavePending || anySituationSaving;
 
   const handleFinalSubmit = useCallback(() => {
-    if (submitMutation.isPending) return;
+    if (submitMutation.isPending || blockSubmitWhileDraftSaving) return;
     submitConfirmHasEmptyRef.current = hasEmptyStudentAnswers(questionsRef.current, studentAnswersRef.current);
     setSubmitConfirmOpen(true);
-  }, [submitMutation.isPending]);
+  }, [submitMutation.isPending, blockSubmitWhileDraftSaving]);
 
   const confirmSubmitExam = useCallback(() => {
+    if (
+      scratchpadSaveLockRef.current ||
+      situationDraftSaveLockRef.current ||
+      scratchpadSavePending ||
+      anySituationSaving
+    ) {
+      return;
+    }
     setSubmitConfirmOpen(false);
     onManualSubmitLockChange?.(true);
     if (typeof document !== "undefined" && document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
     }
     onSubmitConfirmed();
-  }, [onManualSubmitLockChange, onSubmitConfirmed]);
+  }, [onManualSubmitLockChange, onSubmitConfirmed, scratchpadSavePending, anySituationSaving]);
 
   const renderQuestionBlock = (q: PdfExamTakerQuestion, idx: number) => {
     const key = getAnswerKey(q);
@@ -976,8 +1234,20 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
     }
     if (qt === "situation") {
       const sitIdx = situationIndexForQuestion(q);
-      const canvasForSituation = canvases?.find((c) => c.situationIndex === sitIdx);
+      const canvasForSituation = canvases?.find(
+        (c) => (q.questionId != null && c.questionId === q.questionId) || c.situationIndex === sitIdx
+      );
+      const situationCanvasSnapshot =
+        (canvasForSituation as { canvasSnapshot?: string | null })?.canvasSnapshot ?? canvasForSituation?.imageUrl ?? null;
       const promptText = (q.prompt || q.text || "").trim();
+      const st = pdfSituationSaveStatus[no] ?? "idle";
+      const canvasRow = canvasForSituation as { canvasId?: number } | undefined;
+      const situationCanvasJson = coerceFabricCanvasJson(
+        (canvasForSituation as { canvasJson?: unknown })?.canvasJson
+      );
+      const hasServerJson = situationCanvasJson != null;
+      const hasServerImg = !!(situationCanvasSnapshot && String(situationCanvasSnapshot).length > 0);
+      const situationFabricKey = `sit-${sitIdx}-${attemptId}-${canvasRow?.canvasId ?? "new"}-${hasServerJson ? "j" : hasServerImg ? "p" : "0"}`;
       return (
         <div
           key={key}
@@ -1013,46 +1283,61 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
               <p className="mb-1 text-xs font-medium text-slate-600">Qaralama (rəsm)</p>
               <div className="min-h-[140px] overflow-hidden rounded border border-slate-200 bg-white">
                 <SituasiyaCanvas
-                  key={`sit-${sitIdx}-${attemptId}`}
+                  key={situationFabricKey}
                   ref={(el) => {
                     if (el) situationCanvasRefsMap.current.set(sitIdx, el);
                     else situationCanvasRefsMap.current.delete(sitIdx);
                   }}
-                  initialJson={(canvasForSituation as { canvasJson?: object })?.canvasJson ?? null}
-                  initialImageUrl={canvasForSituation?.imageUrl ?? null}
+                  initialJson={situationCanvasJson}
+                  initialImageUrl={situationCanvasSnapshot}
                   situationIndex={sitIdx}
                 />
               </div>
-              <div className="mt-2 flex justify-end">
+              <div className="mt-2">
                 <button
                   type="button"
-                  onClick={() => void saveSituationDraftClick(sitIdx, q.questionId ?? undefined, no)}
                   className="btn-outline px-3 py-1 text-xs"
+                  disabled={st === "saving"}
+                  onClick={async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    await pdfSituationSaveDraft(sitIdx, q.questionId ?? undefined, no);
+                  }}
                 >
-                  Qaralamanı saxla
+                  {st === "saving" ? "Saxlanılır..." : "Qaralamanı saxla"}
                 </button>
               </div>
             </div>
           ) : sitIdx >= 1 ? (
-            <div className="mt-2 flex justify-end">
+            <div className="mt-2">
               <button
                 type="button"
-                onClick={() => void saveSituationDraftClick(0, q.questionId ?? undefined, no)}
                 className="btn-outline px-3 py-1 text-xs"
+                disabled={st === "saving"}
+                onClick={async (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  await pdfSituationSaveDraft(0, q.questionId ?? undefined, no);
+                }}
               >
-                Yadda saxla
+                {st === "saving" ? "Saxlanılır..." : "Qaralamanı saxla"}
               </button>
             </div>
           ) : (
             <div className="mt-2 flex flex-col gap-2">
               <p className="text-xs text-amber-800">Situasiya indeksi tapılmadı — mətni aşağıdakı düymə ilə saxlayın.</p>
-              <div className="flex justify-end">
+              <div className="mt-2">
                 <button
                   type="button"
-                  onClick={() => void saveSituationDraftClick(0, q.questionId ?? undefined, no)}
                   className="btn-outline px-3 py-1 text-xs"
+                  disabled={st === "saving"}
+                  onClick={async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    await pdfSituationSaveDraft(0, q.questionId ?? undefined, no);
+                  }}
                 >
-                  Mətni yadda saxla
+                  {st === "saving" ? "Saxlanılır..." : "Qaralamanı saxla"}
                 </button>
               </div>
             </div>
@@ -1135,6 +1420,11 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
                 </span>
               </div>
               <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-1">
+                {pdfScratchpadDbRestored ? (
+                  <span className="max-w-[9rem] truncate px-1 text-xs font-medium text-emerald-600" title="Səhifə qaralaması serverdən yüklənib">
+                    Yadda saxlanıldı
+                  </span>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => setTool("pen")}
@@ -1154,7 +1444,11 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
               </div>
               <button
                 type="button"
-                onClick={() => void handleScratchpadManualSave()}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void handleScratchpadManualSave();
+                }}
                 disabled={scratchpadSavePending}
                 className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
                 title="PDF səhifə qərələməsini serverə yaz"
@@ -1172,8 +1466,12 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
               </button>
               <button
                 type="button"
-                onClick={handleFinalSubmit}
-                disabled={submitMutation.isPending}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleFinalSubmit();
+                }}
+                disabled={submitMutation.isPending || blockSubmitWhileDraftSaving}
                 className="btn-primary flex items-center gap-2 py-2"
               >
                 <Send className="h-5 w-5" />
@@ -1351,8 +1649,12 @@ export const PdfExamTaker = forwardRef<PdfExamTakerRef, PdfExamTakerProps>(funct
               <button
                 type="button"
                 className="btn-primary"
-                onClick={() => confirmSubmitExam()}
-                disabled={submitMutation.isPending}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  confirmSubmitExam();
+                }}
+                disabled={submitMutation.isPending || blockSubmitWhileDraftSaving}
               >
                 Bəli
               </button>
